@@ -1,0 +1,30 @@
+name: Windows DXUP build (test DLL)
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build-win64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install build tools
+        run: python -m pip install 'meson>=1.4,<2' ninja
+      - name: Configure (MSVC x64)
+        run: meson setup build-msvc-x64 --backend=ninja --buildtype=release
+      - name: Compile DLLs
+        run: meson compile -C build-msvc-x64
+      - name: Collect Windows DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxup-windows-x64-untested
+          path: build-msvc-x64/**/*.dll
+          if-no-files-found: error
