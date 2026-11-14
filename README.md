@@ -1,7 +1,14 @@
 # DXUP
 ## A D3D9 and D3D10 -> D3D11 Translation Layer
 
-### Get [latest build here](https://git.froggi.es/joshua/dxup/pipelines) or [tagged builds here](https://github.com/Joshua-Ashton/dxup/releases).
+### Download the latest Windows builds from [GitHub Actions](https://github.com/mthsk/dxup/actions/workflows/build-windows.yml).
+
+Open a successful workflow run for `master` and download the appropriate artifact under **Artifacts**:
+
+- **`dxup-windows-x86`** for 32-bit games and applications.
+- **`dxup-windows-x64`** for 64-bit games and applications.
+
+Each artifact contains the Windows DLLs. GitHub sign-in may be required to download workflow artifacts, which expire after a limited retention period.
 
 ### What's the point?
  - The main reason is for [DXVK](https://github.com/doitsujin/dxvk), a D3D11->Vulkan translation layer. I'm sure where you can see where this is going... (linux, wine stuff.)
@@ -12,11 +19,9 @@
 D3D10 support is now deprecated on Linux platforms and won't be installed with the script or the verb as DXVK now implements this.
 
 ### How do I use it?
-In order to install DXUP, get a release from either the [releases](https://github.com/Joshua-Ashton/dxup/releases) page (for versioned releases) or from the [build server](https://git.froggi.es/joshua/dxup/pipelines) if you want one built against the latest or a specific commit then run
-```
-export WINEPREFIX=/path/to/.wine-prefix
-winetricks --force setup_dxup_d3d9.verb
-```
+Download the build for your game's architecture from the [Windows build workflow](https://github.com/mthsk/dxup/actions/workflows/build-windows.yml). Expand a successful run's **Artifacts** section, download `dxup-windows-x86` or `dxup-windows-x64`, and extract `d3d9.dll` next to the game executable.
+
+Use the x86 DLL for 32-bit games, and the x64 DLL for 64-bit games. These are CI builds, not tagged releases.
 
 ### How do I build it?
 **Simple (Linux Only):**
