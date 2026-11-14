@@ -787,7 +787,10 @@ namespace dxup {
     desc.DepthBias = depthBiasToD3D11(
       reinterpret::dwordToFloat(m_state->renderState[D3DRS_DEPTHBIAS]), depthBits);
     desc.DepthBiasClamp = D3D11_DEFAULT_DEPTH_BIAS_CLAMP;
-    desc.DepthClipEnable = true;
+    // D3D9 allows applications to disable primitive clipping. D3D11 can
+    // disable z clipping while retaining mandatory xy/w clipping; this is
+    // particularly important for shadow volumes extending past the far plane.
+    desc.DepthClipEnable = m_state->renderState[D3DRS_CLIPPING] != FALSE;
     desc.FillMode = convert::fillMode(m_state->renderState[D3DRS_FILLMODE]);
     desc.ForcedSampleCount = 0;
     desc.FrontCounterClockwise = false;

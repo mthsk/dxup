@@ -525,6 +525,7 @@ namespace dxup {
     renderState[State] = Value;
 
     if (State == D3DRS_CULLMODE ||
+      State == D3DRS_CLIPPING ||
       State == D3DRS_DEPTHBIAS ||
       State == D3DRS_FILLMODE ||
       State == D3DRS_ANTIALIASEDLINEENABLE ||
