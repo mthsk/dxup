@@ -480,8 +480,13 @@ namespace dxup {
     if (m_state->renderState[D3DRS_VERTEXBLEND] != D3DVBF_DISABLE) missing |= 1ull << 2;
     if (m_state->renderState[D3DRS_INDEXEDVERTEXBLENDENABLE]) missing |= 1ull << 3;
     if (m_state->renderState[D3DRS_CLIPPLANEENABLE]) missing |= 1ull << 4;
-    if (m_state->textureStageStates[0][D3DTSS_TEXCOORDINDEX] != 0) missing |= 1ull << 5;
-    if (m_state->textureStageStates[0][D3DTSS_TEXTURETRANSFORMFLAGS] != D3DTTFF_DISABLE) missing |= 1ull << 6;
+    // Texture combiner state only affects the fixed-function pixel path.
+    // An explicit D3D9 pixel shader ignores all texture-stage operations.
+    if (m_state->pixelShader == nullptr &&
+        m_state->textureStageStates[0][D3DTSS_COLOROP] != D3DTOP_DISABLE) {
+      if (m_state->textureStageStates[0][D3DTSS_TEXCOORDINDEX] != 0) missing |= 1ull << 5;
+      if (m_state->textureStageStates[0][D3DTSS_TEXTURETRANSFORMFLAGS] != D3DTTFF_DISABLE) missing |= 1ull << 6;
+    }
     if (lighting) {
       // D3D9 lights vertices without NORMAL using zero diffuse dot product.
       // Ambient and emissive lighting remain active; it is not an invalid FVF.
@@ -516,19 +521,33 @@ namespace dxup {
       if (mode != D3DFOG_NONE && (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZW)
         missing |= 1ull << 14;
     }
-    for (unsigned i = 1; i < 8; ++i)
-      if (m_state->textureStageStates[i][D3DTSS_COLOROP] != D3DTOP_DISABLE)
-        missing |= 1ull << 15;
-    if (m_state->textures[0] && m_state->textures[0]->GetType() != D3DRTYPE_TEXTURE)
-      missing |= 1ull << 16;
-    if (!fixed_function::supportedColorOp(m_state->textureStageStates[0][D3DTSS_COLOROP]) ||
-        !fixed_function::supportedColorOp(m_state->textureStageStates[0][D3DTSS_ALPHAOP]))
-      missing |= 1ull << 17;
-    for (auto arg : {m_state->textureStageStates[0][D3DTSS_COLORARG1],
-                     m_state->textureStageStates[0][D3DTSS_COLORARG2],
-                     m_state->textureStageStates[0][D3DTSS_ALPHAARG1],
-                     m_state->textureStageStates[0][D3DTSS_ALPHAARG2]})
-      if (!fixed_function::supportedArgument(arg)) missing |= 1ull << 18;
+    if (m_state->pixelShader == nullptr &&
+        m_state->textureStageStates[0][D3DTSS_COLOROP] != D3DTOP_DISABLE) {
+      for (unsigned i = 2; i < 8; ++i)
+        if (m_state->textureStageStates[i][D3DTSS_COLOROP] != D3DTOP_DISABLE)
+          missing |= 1ull << 15;
+      for (unsigned i = 0; i < 2; ++i) {
+        const auto& stage = m_state->textureStageStates[i];
+        if (i == 1 && stage[D3DTSS_COLOROP] == D3DTOP_DISABLE)
+          break;
+        // Only direct passthrough coordinates are currently implemented.
+        if (i == 1 && stage[D3DTSS_TEXCOORDINDEX] > 1u) missing |= 1ull << 5;
+        if (i == 1 && stage[D3DTSS_TEXTURETRANSFORMFLAGS] != D3DTTFF_DISABLE)
+          missing |= 1ull << 6;
+        if (m_state->textures[i] && m_state->textures[i]->GetType() != D3DRTYPE_TEXTURE)
+          missing |= 1ull << 16;
+        if (!fixed_function::supportedColorOp(stage[D3DTSS_COLOROP]) ||
+            !fixed_function::supportedColorOp(stage[D3DTSS_ALPHAOP]))
+          missing |= 1ull << 17;
+        if (stage[D3DTSS_COLOROP] != D3DTOP_DISABLE) {
+          for (DWORD arg : {stage[D3DTSS_COLORARG1], stage[D3DTSS_COLORARG2]})
+            if (!fixed_function::supportedArgument(arg)) missing |= 1ull << 18;
+          if (stage[D3DTSS_ALPHAOP] != D3DTOP_DISABLE)
+            for (DWORD arg : {stage[D3DTSS_ALPHAARG1], stage[D3DTSS_ALPHAARG2]})
+              if (!fixed_function::supportedArgument(arg)) missing |= 1ull << 18;
+        }
+      }
+    }
 
     return !missing;
   }
@@ -704,6 +723,26 @@ namespace dxup {
       ps.alphaConfig[1] = stage[D3DTSS_ALPHAARG1];
       ps.alphaConfig[2] = stage[D3DTSS_ALPHAARG2];
       ps.alphaConfig[3] = m_state->renderState[D3DRS_ALPHATESTENABLE];
+      const auto& nextStage = m_state->textureStageStates[1];
+      ps.colorConfig1[0] = ps.colorConfig[0] == D3DTOP_DISABLE
+        ? D3DTOP_DISABLE : nextStage[D3DTSS_COLOROP];
+      ps.colorConfig1[1] = nextStage[D3DTSS_COLORARG1];
+      ps.colorConfig1[2] = nextStage[D3DTSS_COLORARG2];
+      ps.colorConfig1[3] = (m_state->textures[1] != nullptr ? 1u : 0u) |
+        ((nextStage[D3DTSS_TEXCOORDINDEX] & 1u) << 1u);
+      ps.alphaConfig1[0] = nextStage[D3DTSS_ALPHAOP];
+      ps.alphaConfig1[1] = nextStage[D3DTSS_ALPHAARG1];
+      ps.alphaConfig1[2] = nextStage[D3DTSS_ALPHAARG2];
+      // With a missing texture, operations sampling TEXTURE are disabled.
+      // Alpha-based blending also requires a texture, even if the combine
+      // arguments are otherwise drawn from CURRENT and DIFFUSE.
+      if (!m_state->textures[1]) {
+        if (fixed_function::operationNeedsTexture(ps.colorConfig1[0],
+            ps.colorConfig1[1], ps.colorConfig1[2]) ||
+            fixed_function::operationNeedsTexture(ps.alphaConfig1[0],
+              ps.alphaConfig1[1], ps.alphaConfig1[2]))
+          ps.colorConfig1[0] = D3DTOP_DISABLE;
+      }
       ps.testConfig[0] = m_state->renderState[D3DRS_ALPHAFUNC];
       ps.testConfig[1] = m_state->renderState[D3DRS_ALPHAREF] & 255u;
       ps.testConfig[2] = m_state->renderState[D3DRS_FOGENABLE] &&

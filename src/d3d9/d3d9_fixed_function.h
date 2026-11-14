@@ -1,21 +1,22 @@
 #pragma once
 // Baseline, intentionally scoped fixed-function shader generators.
-// Supports the first texture stage, directional/point/spot fixed-function
+// Supports the first two texture stages, directional/point/spot fixed-function
 // lighting, D3D9 material color sources, additive specular and vertex fog.
-// Multi-stage combiners and table fog remain unsupported.
+// Further stages, generated/projected texture coordinates and table fog remain unsupported.
 // Both shaders are SM4 and compiled at runtime through d3dcompiler.dll.
 #include <cstdint>
 #include <string>
 
 namespace dxup { namespace fixed_function {
-  // VS layout key: pretransformed / diffuse / texcoord0 / XYZW / normal / specular.
+  // VS layout key: pretransformed / diffuse / texcoord0 / XYZW / normal / specular / texcoord1.
   inline uint32_t vertexKey(uint32_t fvf) {
     return ((fvf & 0x400Eu) == 0x004u ? 1u : 0u)
        | ((fvf & 0x040u) ? 2u : 0u)
        | ((fvf & 0x0f00u) ? 4u : 0u)
        | ((fvf & 0x400Eu) == 0x4002u ? 8u : 0u)
        | ((fvf & 0x010u) ? 16u : 0u)
-       | ((fvf & 0x080u) ? 32u : 0u);
+       | ((fvf & 0x080u) ? 32u : 0u)
+       | ((fvf & 0x0f00u) >= 0x0200u ? 64u : 0u);
   }
 
   inline std::string vertexSource(uint32_t key) {
@@ -55,8 +56,9 @@ struct VSInput { float4 position : POSITION0;
     if (key & 16u) source += "  float3 normal : NORMAL0;\n";
     if (key & 32u) source += "  float4 specular : COLOR1;\n";
     if (key & 4u) source += "  float4 texcoord : TEXCOORD0;\n";
+    if (key & 64u) source += "  float4 texcoord1 : TEXCOORD1;\n";
     source += R"HLSL(};
-struct VSOutput { float4 position : SV_Position; float4 diffuse : COLOR0; float4 specular : COLOR1; float2 texcoord : TEXCOORD0; float fog : TEXCOORD7; };
+struct VSOutput { float4 position : SV_Position; float4 diffuse : COLOR0; float4 specular : COLOR1; float2 texcoord : TEXCOORD0; float2 texcoord1 : TEXCOORD1; float fog : TEXCOORD7; };
 VSOutput main(VSInput input) {
   VSOutput output;
 )HLSL";
@@ -160,6 +162,7 @@ VSOutput main(VSInput input) {
 )HLSL";
     }
     source += (key & 4u) ? "  output.texcoord = input.texcoord.xy;\n" : "  output.texcoord = float2(0, 0);\n";
+    source += (key & 64u) ? "  output.texcoord1 = input.texcoord1.xy;\n" : "  output.texcoord1 = output.texcoord;\n";
     source += "  return output;\n}\n";
     return source;
   }
@@ -170,6 +173,8 @@ VSOutput main(VSInput input) {
     return R"HLSL(
 Texture2D tex0 : register(t0);
 SamplerState sampler0 : register(s0);
+Texture2D tex1 : register(t1);
+SamplerState sampler1 : register(s1);
 cbuffer FFPixelConstants : register(b1) {
   float4 textureFactor;
   uint4 colorConfig; // op, arg1, arg2, hasTexture
@@ -177,8 +182,10 @@ cbuffer FFPixelConstants : register(b1) {
   uint4 testConfig;  // alphaCompare, alphaRef, fogEnable, reserved
   float4 fogColor;
   uint4 specularControl; // x D3DRS_SPECULARENABLE, other components reserved
+  uint4 colorConfig1; // stage1 op, arg1, arg2, bound texture + texcoord selector
+  uint4 alphaConfig1; // stage1 op, arg1, arg2, reserved
 };
-struct PSInput { float4 position : SV_Position; float4 diffuse : COLOR0; float4 specular : COLOR1; float2 texcoord : TEXCOORD0; float fog : TEXCOORD7; };
+struct PSInput { float4 position : SV_Position; float4 diffuse : COLOR0; float4 specular : COLOR1; float2 texcoord : TEXCOORD0; float2 texcoord1 : TEXCOORD1; float fog : TEXCOORD7; };
 float4 selectArgument(uint source, float4 current, float4 diffuse, float4 textureColor, float4 specular) {
   float4 value = current;
   if ((source & 15u) == 0u) value = diffuse;
@@ -189,14 +196,23 @@ float4 selectArgument(uint source, float4 current, float4 diffuse, float4 textur
   if ((source & 32u) != 0u) value = value.aaaa;
   return value;
 }
-float4 combine(uint operation, float4 a, float4 b) {
+float4 combine(uint operation, float4 a, float4 b,
+               float diffuseAlpha, float textureAlpha, float factorAlpha, float currentAlpha) {
   if (operation == 2u) return a; // SELECTARG1
   if (operation == 3u) return b; // SELECTARG2
-  if (operation == 4u) return a * b; // MODULATE
+  if (operation == 4u) return saturate(a * b); // MODULATE
   if (operation == 5u) return saturate(a * b * 2.0);
   if (operation == 6u) return saturate(a * b * 4.0);
   if (operation == 7u) return saturate(a + b); // ADD
+  if (operation == 8u) return saturate(a + b - 0.5); // ADDSIGNED
+  if (operation == 9u) return saturate((a + b - 0.5) * 2.0); // ADDSIGNED2X
   if (operation == 10u) return saturate(a - b); // SUBTRACT
+  if (operation == 11u) return saturate(a + b - a * b); // ADDSMOOTH
+  if (operation == 12u) return saturate(lerp(b, a, diffuseAlpha)); // BLENDDIFFUSEALPHA
+  if (operation == 13u) return saturate(lerp(b, a, textureAlpha)); // BLENDTEXTUREALPHA
+  if (operation == 14u) return saturate(lerp(b, a, factorAlpha)); // BLENDFACTORALPHA
+  if (operation == 15u) return saturate(a + b * (1.0 - textureAlpha)); // BLENDTEXTUREALPHAPM
+  if (operation == 16u) return saturate(lerp(b, a, currentAlpha)); // BLENDCURRENTALPHA
   return a;
 }
 float4 main(PSInput input) : SV_Target {
@@ -206,12 +222,28 @@ float4 main(PSInput input) : SV_Target {
   if (colorConfig.x != 1u) {
     float4 a = selectArgument(colorConfig.y, color, input.diffuse, texel, input.specular);
     float4 b = selectArgument(colorConfig.z, color, input.diffuse, texel, input.specular);
-    color.rgb = combine(colorConfig.x, a, b).rgb;
+    color.rgb = combine(colorConfig.x, a, b, input.diffuse.a, texel.a, textureFactor.a, input.diffuse.a).rgb;
   }
   if (alphaConfig.x != 1u) {
     float4 a = selectArgument(alphaConfig.y, input.diffuse, input.diffuse, texel, input.specular);
     float4 b = selectArgument(alphaConfig.z, input.diffuse, input.diffuse, texel, input.specular);
-    color.a = combine(alphaConfig.x, a, b).a;
+    color.a = combine(alphaConfig.x, a, b, input.diffuse.a, texel.a, textureFactor.a, input.diffuse.a).a;
+  }
+  // D3D9 evaluates both stage-1 operations against the same incoming
+  // CURRENT value; the color operation does not feed its own alpha operation.
+  if (colorConfig1.x != 1u) {
+    float4 current = color;
+    float4 texel1 = float4(1,1,1,1);
+    if ((colorConfig1.w & 1u) != 0u)
+      texel1 = tex1.Sample(sampler1, (colorConfig1.w & 2u) != 0u ? input.texcoord1 : input.texcoord);
+    float4 a = selectArgument(colorConfig1.y, current, input.diffuse, texel1, input.specular);
+    float4 b = selectArgument(colorConfig1.z, current, input.diffuse, texel1, input.specular);
+    color.rgb = combine(colorConfig1.x, a, b, input.diffuse.a, texel1.a, textureFactor.a, current.a).rgb;
+    if (alphaConfig1.x != 1u) {
+      float4 aa = selectArgument(alphaConfig1.y, current, input.diffuse, texel1, input.specular);
+      float4 ab = selectArgument(alphaConfig1.z, current, input.diffuse, texel1, input.specular);
+      color.a = combine(alphaConfig1.x, aa, ab, input.diffuse.a, texel1.a, textureFactor.a, current.a).a;
+    }
   }
   if (alphaConfig.w != 0u) {
     float reference = testConfig.y / 255.0;
@@ -236,12 +268,14 @@ float4 main(PSInput input) : SV_Target {
     if (op == 1u) return false; // DISABLE
     if (op == 2u) return (arg1 & 15u) == 2u; // SELECTARG1
     if (op == 3u) return (arg2 & 15u) == 2u; // SELECTARG2
+    // BLENDTEXTUREALPHA and BLENDTEXTUREALPHAPM need the texture alpha
+    // even when neither combine argument explicitly names TEXTURE.
+    if (op == 13u || op == 15u) return true;
     return (arg1 & 15u) == 2u || (arg2 & 15u) == 2u;
   }
 
   inline bool supportedColorOp(unsigned op) {
-    return op == 1 || op == 2 || op == 3 || op == 4 || op == 5 ||
-           op == 6 || op == 7 || op == 10;
+    return op >= 1u && op <= 16u;
   }
   inline bool supportedArgument(unsigned arg) {
     return (arg & ~0x3fu) == 0 && ((arg & 0xfu) <= 4u);
