@@ -4,6 +4,13 @@ cpu_family = target_machine.cpu_family()
 add_project_arguments('-DNOMINMAX', language : 'cpp')
 
 dxup_compiler = meson.get_compiler('cpp')
+
+# llvm-mingw defaults to dynamic libc++/libunwind. Keep DXUP's proxy DLLs
+# self-contained by linking the available static runtimes on MinGW/Clang.
+# This does not affect MSVC builds or native Linux Wine builds.
+if host_machine.system() == 'windows' and dxup_compiler.get_id() == 'clang'
+  add_project_link_arguments('-static', language : 'cpp')
+endif
 if dxup_compiler.get_id() == 'msvc'
   dxup_cpp_std='c++latest'
   dxup_msvc=true

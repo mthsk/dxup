@@ -4,6 +4,7 @@
 #include "d3d9_resource.h"
 #include "d3d9_surface.h"
 #include "d3d9_volume.h"
+#include "d3d9_mipmap.h"
 #include <vector>
 
 namespace dxup {
@@ -30,35 +31,62 @@ namespace dxup {
       return E_NOINTERFACE;
     }
 
-    DWORD STDMETHODCALLTYPE GetLevelCount() {
-      return (DWORD)this->GetDXUPResource()->GetMips();
+    DWORD STDMETHODCALLTYPE GetLevelCount() override {
+      CriticalSection cs(this->GetD3D9Device());
+      // D3D9 only exposes level zero of an autogen mip chain to the application.
+      return (this->m_d3d9Desc.Usage & D3DUSAGE_AUTOGENMIPMAP)
+        ? 1 : this->GetDXUPResource()->GetMips();
     }
 
+    void STDMETHODCALLTYPE GenerateMipSubLevels() override {
+      CriticalSection cs(this->GetD3D9Device());
+      if (!(this->m_d3d9Desc.Usage & D3DUSAGE_AUTOGENMIPMAP))
+        return;
 
-    void STDMETHODCALLTYPE GenerateMipSubLevels() {
-      if (this->GetDXUPResource()->GetSRV(false) != nullptr)
-        this->GetContext()->GenerateMips(this->GetDXUPResource()->GetSRV(false));
+      ID3D11ShaderResourceView* srv = this->GetDXUPResource()->GetSRV(false);
+      if (srv != nullptr)
+        this->GetContext()->GenerateMips(srv);
       else
-        log::warn("GenerateMipSubLevels called on a texture with no SRV.");
+        log::warn("GenerateMipSubLevels called on an autogen texture with no SRV.");
     }
 
     DWORD STDMETHODCALLTYPE SetLOD(DWORD LODNew) override {
-      log::stub("Direct3DBaseTexture9::SetLOD");
-      return 0;
+      CriticalSection cs(this->GetD3D9Device());
+      if (this->m_d3d9Desc.Pool != D3DPOOL_MANAGED)
+        return 0;
+
+      m_lod = mipmap::clampLOD(LODNew, this->GetDXUPResource()->GetMips());
+      // A texture may be bound at multiple pixel/vertex sampler stages.
+      this->GetD3D9Device()->MarkTextureLODDirty(this);
+      return m_lod;
     }
     DWORD STDMETHODCALLTYPE GetLOD() override {
-      log::stub("Direct3DBaseTexture9::GetLOD");
-      return 0;
+      CriticalSection cs(this->GetD3D9Device());
+      return this->m_d3d9Desc.Pool == D3DPOOL_MANAGED ? m_lod : 0;
     }
 
     HRESULT STDMETHODCALLTYPE SetAutoGenFilterType(D3DTEXTUREFILTERTYPE FilterType) override {
-      log::stub("Direct3DBaseTexture9::SetAutoGenFilterType");
+      CriticalSection cs(this->GetD3D9Device());
+      if (!(this->m_d3d9Desc.Usage & D3DUSAGE_AUTOGENMIPMAP))
+        return D3DERR_INVALIDCALL;
+
+      // D3D11 GenerateMips implements linear filtering only. Do not silently
+      // claim point/anisotropic/other generation algorithms are supported.
+      if (FilterType != D3DTEXF_LINEAR)
+        return D3DERR_INVALIDCALL;
+
+      m_autoGenFilter = FilterType;
       return D3D_OK;
     }
     D3DTEXTUREFILTERTYPE STDMETHODCALLTYPE GetAutoGenFilterType() override {
-      log::stub("Direct3DBaseTexture9::GetAutoGenFilterType");
-      return D3DTEXF_ANISOTROPIC;
+      CriticalSection cs(this->GetD3D9Device());
+      return (this->m_d3d9Desc.Usage & D3DUSAGE_AUTOGENMIPMAP)
+        ? m_autoGenFilter : D3DTEXF_NONE;
     }
+
+  private:
+    DWORD m_lod = 0;
+    D3DTEXTUREFILTERTYPE m_autoGenFilter = D3DTEXF_LINEAR;
 
   };
 

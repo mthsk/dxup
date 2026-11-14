@@ -288,7 +288,7 @@ namespace dxup
 	{
 		UINT DataSize = sizeof(void*);
 		IDX10* returnAddress = nullptr;
-		if (FAILED(address->GetPrivateData(__uuidof(D3D10Map), &DataSize, &returnAddress)))
+		if (FAILED(address->GetPrivateData(D3D10Map::guid, &DataSize, &returnAddress)))
 		{
 			DXUP_Log(Fail, "Failed to lookup D3D11 interface.");
 			return nullptr;
@@ -302,7 +302,7 @@ namespace dxup
 	{
 		UINT DataSize = sizeof(void*);
 		IDX10* returnAddress;
-		if (!FAILED(address->GetPrivateData(__uuidof(D3D10Map), &DataSize, &returnAddress)))
+		if (!FAILED(address->GetPrivateData(D3D10Map::guid, &DataSize, &returnAddress)))
 			return (IDX10*)returnAddress;
 
 		return new DX10(address);

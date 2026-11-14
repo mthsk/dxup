@@ -14,9 +14,9 @@ namespace dxup {
     };
 
     struct DclInfo {
-      UsageType type;
-      D3DDECLUSAGE usage;
-      uint32_t usageIndex;
+      UsageType type = UsageType::None;
+      D3DDECLUSAGE usage = D3DDECLUSAGE_POSITION;
+      uint32_t usageIndex = 0;
       bool target = false;
       bool centroid = false;
     };

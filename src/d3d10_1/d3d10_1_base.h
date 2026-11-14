@@ -95,7 +95,7 @@ namespace dxup
 		{
 			D3D10Unknown<DX10Interface, DX11Interface>::SetBase(pNewBase);
 
-			pNewBase->SetPrivateData(__uuidof(D3D10Map), sizeof(void*), this);
+			pNewBase->SetPrivateData(D3D10Map::guid, sizeof(void*), this);
 		}
 
 		HRESULT STDMETHODCALLTYPE SetPrivateData(
@@ -153,12 +153,3 @@ namespace dxup
 		}
 	}
 }
-
-#ifdef _MSC_VER
-	namespace dxup
-	{
-		struct __declspec(uuid("2ec54fe1-3185-40aa-9a32-7e634a8823f2")) D3D10Map;
-	}
-#else
-	DXUP_DEFINE_GUID(dxup::D3D10Map);
-#endif

@@ -1,5 +1,6 @@
 #include "d3d9_d3d11_resource.h"
 #include "d3d9_util.h"
+#include "d3d9_format.h"
 #include <algorithm>
 
 namespace dxup {
@@ -8,6 +9,9 @@ namespace dxup {
   // We then map this and CopySubresourceRegion on unmapping.
   // If we don't need the staging res. will be nullptr, some logic relies on this.
   bool DXUPResource::NeedsStaging(D3D11_USAGE d3d11Usage, DWORD d3d9Usage, D3DFORMAT d3d9Format) {
+    // INTZ is a default-pool GPU depth texture, not a lockable CPU surface.
+    if (d3d9Format == D3DFMT_INTZ)
+      return false;
     if (d3d11Usage == D3D11_USAGE_DEFAULT)
       return true;
 
@@ -80,13 +84,25 @@ namespace dxup {
         srvDesc.Texture2DArray.ArraySize = -1;
       }
 
-      srvDesc.Format = desc.Format;
-      srvDesc.Format = convert::makeUntypeless(srvDesc.Format, false);
-      device->GetD3D11Device()->CreateShaderResourceView(texture, &srvDesc, &srv);
+      // A typeless depth texture requires a typed view of its depth plane.
+      // D3D11 cannot infer this view format from R24G8_TYPELESS.
+      srvDesc.Format = d3d9Format == D3DFMT_INTZ
+        ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+        : convert::makeUntypeless(desc.Format, false);
+      HRESULT srvResult = device->GetD3D11Device()->CreateShaderResourceView(texture, &srvDesc, &srv);
+      if (FAILED(srvResult)) {
+        log::warn("INTZ/texture SRV creation failed: 0x%08x", (unsigned)srvResult);
+        if (d3d9Format == D3DFMT_INTZ)
+          return nullptr;
+      }
 
-      srvDesc.Format = desc.Format;
-      srvDesc.Format = convert::makeUntypeless(srvDesc.Format, true);
-      device->GetD3D11Device()->CreateShaderResourceView(texture, &srvDesc, &srvSRGB);
+      if (d3d9Format == D3DFMT_INTZ) {
+        // No sRGB interpretation exists for depth; use its regular SRV.
+        srvSRGB = srv;
+      } else {
+        srvDesc.Format = convert::makeUntypeless(desc.Format, true);
+        device->GetD3D11Device()->CreateShaderResourceView(texture, &srvDesc, &srvSRGB);
+      }
     }
 
     Com<ID3D11Texture2D> stagingTexture;

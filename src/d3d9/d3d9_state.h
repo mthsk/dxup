@@ -7,6 +7,7 @@
 #include "d3d9_vertexdeclaration.h"
 #include "d3d9_buffer.h"
 #include "d3d9_constant_buffer.h"
+#include <map>
 
 namespace dxup {
 
@@ -30,9 +31,26 @@ namespace dxup {
   class D3D9State {
   public:
     D3D9State(Direct3DDevice9Ex* device, uint32_t stateBlockType);
+    ~D3D9State();
+
+    // Fixed-function API state is preserved for queries and state blocks.
+    // The D3D11 renderer does not yet consume these values for fixed-function shaders.
+    HRESULT SetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix);
+    HRESULT GetTransform(D3DTRANSFORMSTATETYPE state, D3DMATRIX* matrix);
+    HRESULT MultiplyTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix);
+    HRESULT SetMaterial(const D3DMATERIAL9* material);
+    HRESULT GetMaterial(D3DMATERIAL9* material);
+    HRESULT SetLight(DWORD index, const D3DLIGHT9* light);
+    HRESULT GetLight(DWORD index, D3DLIGHT9* light);
+    HRESULT LightEnable(DWORD index, BOOL enabled);
+    HRESULT GetLightEnable(DWORD index, BOOL* enabled);
+    HRESULT SetClipPlane(DWORD index, const float* plane);
+    HRESULT GetClipPlane(DWORD index, float* plane);
+    void ResetFixedFunctionState();
 
     HRESULT GetTexture(DWORD Stage, IDirect3DBaseTexture9** ppTexture);
     HRESULT SetTexture(DWORD Stage, IDirect3DBaseTexture9* pTexture);
+    void MarkTextureLODDirty(IDirect3DBaseTexture9* texture);
 
     HRESULT GetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9** ppRenderTarget);
     HRESULT SetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9* pRenderTarget);
@@ -67,6 +85,9 @@ namespace dxup {
     HRESULT GetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer9** ppStreamData, UINT* pOffsetInBytes, UINT* pStride);
     HRESULT SetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer9* pStreamData, UINT OffsetInBytes, UINT Stride);
 
+    HRESULT SetStreamSourceFreq(UINT StreamNumber, UINT Setting);
+    HRESULT GetStreamSourceFreq(UINT StreamNumber, UINT* pSetting);
+
     HRESULT GetIndices(IDirect3DIndexBuffer9** ppIndexData);
     HRESULT SetIndices(IDirect3DIndexBuffer9* pIndexData);
 
@@ -99,7 +120,7 @@ namespace dxup {
     uint32_t dirtySamplers;
 
     // Replace this with bitvec sometime...
-    std::array<bool, D3DRS_BLENDOPALPHA + 1> textureCaptured;
+    std::array<bool, 20> textureCaptured = {};
     // Manual COM
     std::array<IDirect3DBaseTexture9*, 20> textures;
 
@@ -116,18 +137,20 @@ namespace dxup {
 
     std::array<ComPrivate<Direct3DSurface9>, 4> renderTargets;
 
-    std::array<bool, 16> vertexBufferCaptures;
+    std::array<bool, 16> vertexBufferCaptures = {};
     std::array<ComPrivate<Direct3DVertexBuffer9>, 16> vertexBuffers;
     std::array<UINT, 16> vertexOffsets;
     std::array<UINT, 16> vertexStrides;
+    std::array<UINT, 16> streamFrequencies;
+    std::array<bool, 16> streamFrequencyCaptures = {};
 
-    std::array<bool, D3DRS_BLENDOPALPHA + 1> renderStateCaptures;
+    std::array<bool, D3DRS_BLENDOPALPHA + 1> renderStateCaptures = {};
     std::array<DWORD, D3DRS_BLENDOPALPHA + 1> renderState;
 
-    std::array<std::array<bool, D3DSAMP_DMAPOFFSET + 1>, 20> samplerStateCaptures;
+    std::array<std::array<bool, D3DSAMP_DMAPOFFSET + 1>, 20> samplerStateCaptures = {};
     std::array<std::array<DWORD, D3DSAMP_DMAPOFFSET + 1>, 20> samplerStates;
 
-    std::array<std::array<bool, D3DTSS_CONSTANT + 1>, 8> textureStageStateCaptures;
+    std::array<std::array<bool, D3DTSS_CONSTANT + 1>, 8> textureStageStateCaptures = {};
     std::array<std::array<DWORD, D3DTSS_CONSTANT + 1>, 8> textureStageStates;
 
     bool indexBufferCaptured = false;
@@ -135,6 +158,22 @@ namespace dxup {
 
     D3D9ShaderConstants vsConstants;
     D3D9ShaderConstants psConstants;
+
+    // A transform is either explicit or the identity. Keys include view (2),
+    // projection (3), texture stages (16..23), and up to 256 world matrices.
+    std::map<DWORD, D3DMATRIX> transforms;
+    D3DMATERIAL9 material = {};
+    bool materialCaptured = false;
+    struct LightRecord {
+      D3DLIGHT9 parameters = {};
+      BOOL enabled = FALSE;
+      bool parametersCaptured = false;
+      bool enabledCaptured = false;
+    };
+    std::map<DWORD, LightRecord> lights;
+    std::array<std::array<float, 4>, 6> clipPlanes = {};
+    std::array<bool, 6> clipPlaneCaptured = {};
+    void captureFixedFunction(bool recapture);
 
     D3DVIEWPORT9 viewport;
     bool viewportCaptured = false;

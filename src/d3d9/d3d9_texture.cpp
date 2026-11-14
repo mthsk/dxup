@@ -27,7 +27,7 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DTexture9::GetLevelDesc(UINT Level, D3DSURFACE_DESC *pDesc) {
     CriticalSection(this->GetD3D9Device());
 
-    if (Level >= m_surfaces.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "GetLevelDesc: level out of bounds.");
 
     return m_surfaces[Level]->GetDesc(pDesc);
@@ -38,7 +38,7 @@ namespace dxup {
 
     InitReturnPtr(ppSurfaceLevel);
 
-    if (Level >= m_surfaces.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "GetSurfaceLevel: subresource out of bounds (Level = %d).", Level);
 
     if (ppSurfaceLevel == nullptr)
@@ -52,7 +52,7 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DTexture9::LockRect(UINT Level, D3DLOCKED_RECT* pLockedRect, const RECT* pRect, DWORD Flags) {
     CriticalSection(this->GetD3D9Device());
 
-    if (Level >= m_surfaces.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "LockRect: subresource out of bounds (Level = %d).", Level);
 
     return m_surfaces[Level]->LockRect(pLockedRect, pRect, Flags);
@@ -61,7 +61,7 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DTexture9::UnlockRect(UINT Level) {
     CriticalSection(this->GetD3D9Device());
 
-    if (Level >= m_surfaces.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "UnlockRect: subresource out of bounds (Level = %d).", Level);
 
     return m_surfaces[Level]->UnlockRect();
@@ -99,6 +99,11 @@ namespace dxup {
     if (outTexture == nullptr)
       return log::d3derr(D3DERR_INVALIDCALL, "Direct3DTexture9::Create: outTexture was nullptr.");
 
+    const bool isINTZ = format == D3DFMT_INTZ;
+    if (isINTZ && (pool != D3DPOOL_DEFAULT ||
+                   (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DYNAMIC | D3DUSAGE_AUTOGENMIPMAP))))
+      return log::d3derr(D3DERR_INVALIDCALL, "INTZ: requires default-pool, non-dynamic depth texture.");
+
     D3D11_USAGE d3d11Usage = convert::usage(pool, usage, D3DRTYPE_TEXTURE);
 
     D3D11_TEXTURE2D_DESC desc;
@@ -124,6 +129,10 @@ namespace dxup {
 
       desc.MiscFlags |= (usage & D3DUSAGE_AUTOGENMIPMAP) ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
     }
+    // GTA IV creates INTZ with Usage == 0. Unlike an ordinary texture,
+    // INTZ must support depth rendering AND depth sampling even then.
+    if (isINTZ)
+      desc.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
 
     Com<ID3D11Texture2D> texture;
     HRESULT result = device->GetD3D11Device()->CreateTexture2D(&desc, nullptr, &texture);
@@ -175,7 +184,7 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DCubeTexture9::GetLevelDesc(UINT Level, D3DSURFACE_DESC *pDesc) {
     CriticalSection(this->GetD3D9Device());
 
-    if (Level >= m_surfaces.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "GetLevelDesc: level out of bounds.");
 
     return m_surfaces[Level]->GetDesc(pDesc);
@@ -183,6 +192,9 @@ namespace dxup {
 
   HRESULT STDMETHODCALLTYPE Direct3DCubeTexture9::GetCubeMapSurface(D3DCUBEMAP_FACES FaceType, UINT Level, IDirect3DSurface9** ppCubeMapSurface) {
     CriticalSection(this->GetD3D9Device());
+
+    if (FaceType < D3DCUBEMAP_FACE_POSITIVE_X || FaceType > D3DCUBEMAP_FACE_NEGATIVE_Z || Level >= GetLevelCount())
+      return D3DERR_INVALIDCALL;
 
     UINT subresource = D3D11CalcSubresource(Level, (UINT)FaceType, this->GetDXUPResource()->GetMips());
 
@@ -202,6 +214,9 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DCubeTexture9::LockRect(D3DCUBEMAP_FACES FaceType, UINT Level, D3DLOCKED_RECT* pLockedRect, const RECT* pRect, DWORD Flags) {
     CriticalSection(this->GetD3D9Device());
 
+    if (FaceType < D3DCUBEMAP_FACE_POSITIVE_X || FaceType > D3DCUBEMAP_FACE_NEGATIVE_Z || Level >= GetLevelCount())
+      return D3DERR_INVALIDCALL;
+
     UINT subresource = D3D11CalcSubresource(Level, FaceType, this->GetDXUPResource()->GetMips());
 
     if (subresource >= m_surfaces.size())
@@ -212,6 +227,9 @@ namespace dxup {
 
   HRESULT STDMETHODCALLTYPE Direct3DCubeTexture9::UnlockRect(D3DCUBEMAP_FACES FaceType, UINT Level) {
     CriticalSection(this->GetD3D9Device());
+
+    if (FaceType < D3DCUBEMAP_FACE_POSITIVE_X || FaceType > D3DCUBEMAP_FACE_NEGATIVE_Z || Level >= GetLevelCount())
+      return D3DERR_INVALIDCALL;
 
     UINT subresource = D3D11CalcSubresource(Level, (UINT)FaceType, this->GetDXUPResource()->GetMips());
 
@@ -320,7 +338,7 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DVolumeTexture9::GetLevelDesc(UINT Level, D3DVOLUME_DESC* pDesc) {
     CriticalSection(this->GetD3D9Device());
 
-    if (Level >= m_volumes.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "GetLevelDesc: level out of bounds.");
 
     return m_volumes[Level]->GetDesc(pDesc);
@@ -331,7 +349,7 @@ namespace dxup {
 
     InitReturnPtr(ppVolumeLevel);
 
-    if (Level >= m_volumes.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "GetVolumeLevel: subresource out of bounds (Level = %d).", Level);
 
     if (ppVolumeLevel == nullptr)
@@ -345,7 +363,7 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DVolumeTexture9::LockBox(UINT Level, D3DLOCKED_BOX* pLockedBox, const D3DBOX* pBox, DWORD Flags) {
     CriticalSection(this->GetD3D9Device());
 
-    if (Level >= m_volumes.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "LockBox: subresource out of bounds (Level = %d).", Level);
 
     return m_volumes[Level]->LockBox(pLockedBox, pBox, Flags);
@@ -354,7 +372,7 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DVolumeTexture9::UnlockBox(UINT Level) {
     CriticalSection(this->GetD3D9Device());
 
-    if (Level >= m_volumes.size())
+    if (Level >= GetLevelCount())
       return log::d3derr(D3DERR_INVALIDCALL, "UnlockBox: subresource out of bounds (Level = %d).", Level);
 
     return m_volumes[Level]->UnlockBox();

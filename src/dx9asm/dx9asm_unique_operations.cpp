@@ -32,7 +32,7 @@ namespace dxup {
       const DX9Operand* usageToken = operation.getOperandByType(optype::UsageToken);
       const DX9Operand* dst = operation.getOperandByType(optype::Dst);
 
-      RegisterMapping mapping;
+      RegisterMapping mapping{};
       mapping.dx9Id = dst->getRegNumber();
       mapping.dx9Type = dst->getRegType();
       mapping.readMask |= calcWriteMask(*dst);
@@ -60,6 +60,14 @@ namespace dxup {
       else if (dst->getRegType() == D3DSPR_OUTPUT) {
         mapping.dxbcOperand.setRegisterType(D3D10_SB_OPERAND_TYPE_OUTPUT);
         mapping.dclInfo.type = UsageType::Output;
+      }
+      else if (dst->getRegType() == D3DSPR_MISCTYPE &&
+               getShaderType() == ShaderType::Pixel && dst->getRegNumber() == D3DSMO_POSITION) {
+        // ps_3_0 dcl vPos.xy: a read-only rasterizer input, not a shader output.
+        // The position is provided as SV_Position by the D3D11 pixel pipeline.
+        mapping.dclInfo.type = UsageType::Input;
+        mapping.dclInfo.usage = D3DDECLUSAGE_POSITION;
+        mapping.dclInfo.usageIndex = 0;
       }
       else if (dst->getRegType() == D3DSPR_SAMPLER) {
 
@@ -104,6 +112,265 @@ namespace dxup {
 
       getRegisterMap().addRegisterMapping(transient, generateId, mapping);
 
+      return true;
+    }
+
+    bool ShaderCodeTranslator::handleTexkill(DX9Operation& operation) {
+      // D3D9 TEXKILL reads (despite its assembly "destination" syntax).
+      // Discard when any of x, y or z is negative, not when alpha is negative.
+      const DX9Operand* reg = operation.getOperandByType(optype::Dst);
+      if (getShaderType() != ShaderType::Pixel || !reg)
+        return false;
+      RegisterMapping* mapping = getRegisterMap().lookupOrCreateRegisterMapping(
+        *this, reg->getRegType(), reg->getRegNumber(),
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(
+          D3D10_SB_OPERAND_4_COMPONENT_MASK_X | D3D10_SB_OPERAND_4_COMPONENT_MASK_Y |
+          D3D10_SB_OPERAND_4_COMPONENT_MASK_Z), 0);
+      DXBCOperand value = mapping->dxbcOperand;
+      value.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(
+          D3D10_SB_4_COMPONENT_X, D3D10_SB_4_COMPONENT_Y,
+          D3D10_SB_4_COMPONENT_Z, D3D10_SB_4_COMPONENT_X));
+
+      DXBCOperand test = getRegisterMap().getNextInternalTemp();
+      DXBCOperand destination = test;
+      destination.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(
+          D3D10_SB_OPERAND_4_COMPONENT_MASK_X | D3D10_SB_OPERAND_4_COMPONENT_MASK_Y |
+          D3D10_SB_OPERAND_4_COMPONENT_MASK_Z));
+      test.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE(
+          D3D10_SB_4_COMPONENT_X, D3D10_SB_4_COMPONENT_Y,
+          D3D10_SB_4_COMPONENT_Z, D3D10_SB_4_COMPONENT_X));
+      DXBCOperation{ D3D10_SB_OPCODE_LT, false }
+        .appendOperand(destination).appendOperand(value)
+        .appendOperand(DXBCOperand{ 0, 0, 0, 0 }).push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_DISCARD, false }
+        .setExtra(ENCODE_D3D10_SB_INSTRUCTION_TEST_BOOLEAN(D3D10_SB_INSTRUCTION_TEST_NONZERO))
+        .appendOperand(test).push(*this);
+      return true;
+    }
+
+    bool ShaderCodeTranslator::handleTexldl(DX9Operation& operation) {
+      const DX9Operand* dst = operation.getOperandByType(optype::Dst);
+      const DX9Operand* coords = operation.getOperandByType(optype::Src0);
+      const DX9Operand* sampler = operation.getOperandByType(optype::Src1);
+      if (!dst || !coords || !sampler || sampler->getRegType() != D3DSPR_SAMPLER)
+        return false;
+      const uint32_t slot = sampler->getRegNumber();
+      if (!isSamplerUsed(slot)) {
+        m_samplers.push_back({ slot, D3D10_SB_RESOURCE_DIMENSION_TEXTURE2D });
+      }
+      DXBCOperand dest{ *this, operation, *dst, 0 };
+      DXBCOperand uv{ *this, operation, *coords, 0 };
+      DXBCOperand lod{ *this, operation, *coords, 0 };
+      lod.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(D3D10_SB_4_COMPONENT_W));
+      DXBCOperand resource{ D3D10_SB_OPERAND_TYPE_RESOURCE, 1 };
+      resource.setData(&slot, 1).setRepresentation(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+      resource.setSwizzleOrWritemask(noSwizzle);
+      DXBCOperand samplerOp{ D3D10_SB_OPERAND_TYPE_SAMPLER, 1 };
+      samplerOp.setData(&slot, 1).setRepresentation(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+      samplerOp.setComponents(0);
+      DXBCOperation{ D3D10_SB_OPCODE_SAMPLE_L, operation.saturate() }
+        .setSampler(true)
+        .appendOperand(dest).appendOperand(uv)
+        .appendOperand(resource).appendOperand(samplerOp)
+        .appendOperand(lod).push(*this);
+      return true;
+    }
+
+    bool ShaderCodeTranslator::handleTexldd(DX9Operation& operation) {
+      // texldd dst, coordinates, sampler, gradient-x, gradient-y
+      const DX9Operand* dst = operation.getOperandByType(optype::Dst);
+      const DX9Operand* coords = operation.getOperandByType(optype::Src0);
+      const DX9Operand* sampler = operation.getOperandByType(optype::Src1);
+      const DX9Operand* gradX = operation.getOperandByType(optype::Src2);
+      const DX9Operand* gradY = operation.getOperandByType(optype::Src3);
+      if (getShaderType() != ShaderType::Pixel || !dst || !coords || !sampler ||
+          !gradX || !gradY || sampler->getRegType() != D3DSPR_SAMPLER)
+        return false;
+      const uint32_t slot = sampler->getRegNumber();
+      if (!isSamplerUsed(slot))
+        m_samplers.push_back({ slot, D3D10_SB_RESOURCE_DIMENSION_TEXTURE2D });
+      DXBCOperand resource{ D3D10_SB_OPERAND_TYPE_RESOURCE, 1 };
+      resource.setData(&slot, 1).setRepresentation(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+      resource.setSwizzleOrWritemask(noSwizzle);
+      DXBCOperand samplerOp{ D3D10_SB_OPERAND_TYPE_SAMPLER, 1 };
+      samplerOp.setData(&slot, 1).setRepresentation(0, D3D10_SB_OPERAND_INDEX_IMMEDIATE32);
+      samplerOp.setComponents(0);
+      DXBCOperation{ D3D10_SB_OPCODE_SAMPLE_D, operation.saturate() }
+        .setSampler(true)
+        .appendOperand(DXBCOperand{ *this, operation, *dst, 0 })
+        .appendOperand(DXBCOperand{ *this, operation, *coords, 0 })
+        .appendOperand(resource).appendOperand(samplerOp)
+        .appendOperand(DXBCOperand{ *this, operation, *gradX, 0 })
+        .appendOperand(DXBCOperand{ *this, operation, *gradY, 0 })
+        .push(*this);
+      return true;
+    }
+
+    // D3D9 loop aL, i#: i.x iterations; aL starts at i.y and advances
+    // by signed i.z. Keep a separate iteration counter from aL so a
+    // negative or non-unit step does not affect the number of iterations.
+    bool ShaderCodeTranslator::handleLoop(DX9Operation& operation) {
+      const DX9Operand* loopReg = operation.getOperandByType(optype::LoopCounter);
+      const DX9Operand* src = operation.getOperandByType(optype::Src0);
+      if (!loopReg || !src || loopReg->getRegType() != D3DSPR_LOOP ||
+          src->getRegType() != D3DSPR_CONSTINT)
+        return false;
+
+      DXBCOperand constant{ *this, operation, *src, 0 };
+      const auto select = [](DXBCOperand op, uint32_t component) {
+        op.setSwizzleOrWritemask(
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(component));
+        return op;
+      };
+      const auto writeX = [](DXBCOperand op) {
+        op.setSwizzleOrWritemask(
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) |
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(D3D10_SB_OPERAND_4_COMPONENT_MASK_X));
+        return op;
+      };
+
+      DXBCOperand al = getRegisterMap().lookupOrCreateRegisterMapping(
+        *this, D3DSPR_LOOP, loopReg->getRegNumber(), 1, 1)->dxbcOperand;
+      DXBCOperand count = getRegisterMap().getNextInternalTemp();
+      DXBCOperand stride = getRegisterMap().getNextInternalTemp();
+      DXBCOperand savedAL;
+      const bool nested = !m_loopCounters.empty();
+      if (nested) {
+        savedAL = getRegisterMap().getNextInternalTemp();
+        DXBCOperation{ D3D10_SB_OPCODE_MOV, false }
+          .appendOperand(writeX(savedAL)).appendOperand(select(al, D3D10_SB_4_COMPONENT_X))
+          .push(*this);
+      }
+      DXBCOperation{ D3D10_SB_OPCODE_MOV, false }
+        .appendOperand(writeX(count)).appendOperand(DXBCOperand{0,0,0,0}).push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_MOV, false }
+        .appendOperand(writeX(al)).appendOperand(select(constant, D3D10_SB_4_COMPONENT_Y))
+        .push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_MOV, false }
+        .appendOperand(writeX(stride)).appendOperand(select(constant, D3D10_SB_4_COMPONENT_Z))
+        .push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_LOOP, false }.push(*this);
+      DXBCOperand test = getRegisterMap().getNextInternalTemp();
+      DXBCOperation{ D3D10_SB_OPCODE_IGE, false }
+        .appendOperand(writeX(test))
+        .appendOperand(select(count, D3D10_SB_4_COMPONENT_X))
+        .appendOperand(select(constant, D3D10_SB_4_COMPONENT_X)).push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_BREAKC, false }
+        .setExtra(ENCODE_D3D10_SB_INSTRUCTION_TEST_BOOLEAN(D3D10_SB_INSTRUCTION_TEST_NONZERO))
+        .appendOperand(select(test, D3D10_SB_4_COMPONENT_X)).push(*this);
+      m_loopCounters.push_back({count, stride, savedAL, nested});
+      return true;
+    }
+
+    bool ShaderCodeTranslator::handleEndLoop(DX9Operation&) {
+      if (m_loopCounters.empty()) {
+        log::fail("endloop without matching loop");
+        return false;
+      }
+      const LoopFrame frame = m_loopCounters.back();
+      m_loopCounters.pop_back();
+      const auto readX = [](DXBCOperand op) {
+        op.setSwizzleOrWritemask(
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(D3D10_SB_4_COMPONENT_X));
+        return op;
+      };
+      const auto writeX = [](DXBCOperand op) {
+        op.setSwizzleOrWritemask(
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) |
+          ENCODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(D3D10_SB_OPERAND_4_COMPONENT_MASK_X));
+        return op;
+      };
+      DXBCOperand al = getRegisterMap().lookupOrCreateRegisterMapping(
+        *this, D3DSPR_LOOP, 0, 1, 1)->dxbcOperand;
+      DXBCOperation{ D3D10_SB_OPCODE_IADD, false }
+        .appendOperand(writeX(frame.counter))
+        .appendOperand(readX(frame.counter))
+        .appendOperand(DXBCOperand{1,1,1,1}).push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_IADD, false }
+        .appendOperand(writeX(al)).appendOperand(readX(al))
+        .appendOperand(readX(frame.step)).push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_ENDLOOP, false }.push(*this);
+      if (frame.hasSavedAL) {
+        DXBCOperation{ D3D10_SB_OPCODE_MOV, false }
+          .appendOperand(writeX(al)).appendOperand(readX(frame.savedAL)).push(*this);
+      }
+      return true;
+    }
+
+    bool ShaderCodeTranslator::handleRep(DX9Operation& operation) {
+      // D3D9 REP uses only i#.x; the count is a signed integer [0,255].
+      // Translate to a structured DXBC loop with an independent integer
+      // counter for every nesting level. Never let the body execute for 0.
+      const DX9Operand* src = operation.getOperandByType(optype::Src0);
+      if (!src || src->getRegType() != D3DSPR_CONSTINT)
+        return false;
+
+      DXBCOperand iterations{ *this, operation, *src, 0 };
+      iterations.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(D3D10_SB_4_COMPONENT_X));
+
+      DXBCOperand counter = getRegisterMap().getNextInternalTemp();
+      DXBCOperand counterDst = counter;
+      counterDst.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(D3D10_SB_OPERAND_4_COMPONENT_MASK_X));
+      DXBCOperand counterSrc = counter;
+      counterSrc.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(D3D10_SB_4_COMPONENT_X));
+      // Allocate a separate comparison result to preserve the counter.
+      DXBCOperand testDst = getRegisterMap().getNextInternalTemp();
+      testDst.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(D3D10_SB_OPERAND_4_COMPONENT_MASK_X));
+      DXBCOperand testSrc = testDst;
+      testSrc.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(D3D10_SB_4_COMPONENT_X));
+
+      DXBCOperation{ D3D10_SB_OPCODE_MOV, false }
+        .appendOperand(counterDst).appendOperand(DXBCOperand{ 0, 0, 0, 0 }).push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_LOOP, false }.push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_IGE, false }
+        .appendOperand(testDst).appendOperand(counterSrc).appendOperand(iterations).push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_BREAKC, false }
+        .setExtra(ENCODE_D3D10_SB_INSTRUCTION_TEST_BOOLEAN(D3D10_SB_INSTRUCTION_TEST_NONZERO))
+        .appendOperand(testSrc).push(*this);
+      m_repCounters.push_back(counter);
+      return true;
+    }
+
+    bool ShaderCodeTranslator::handleEndRep(DX9Operation&) {
+      if (m_repCounters.empty()) {
+        log::fail("endrep without rep");
+        return false;
+      }
+      DXBCOperand counter = m_repCounters.back();
+      m_repCounters.pop_back();
+      DXBCOperand counterDst = counter;
+      counterDst.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_MASK(D3D10_SB_OPERAND_4_COMPONENT_MASK_X));
+      DXBCOperand counterSrc = counter;
+      counterSrc.setSwizzleOrWritemask(
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECTION_MODE(D3D10_SB_OPERAND_4_COMPONENT_SELECT_1_MODE) |
+        ENCODE_D3D10_SB_OPERAND_4_COMPONENT_SELECT_1(D3D10_SB_4_COMPONENT_X));
+      DXBCOperation{ D3D10_SB_OPCODE_IADD, false }
+        .appendOperand(counterDst).appendOperand(counterSrc)
+        .appendOperand(DXBCOperand{ 1, 1, 1, 1 }).push(*this);
+      DXBCOperation{ D3D10_SB_OPCODE_ENDLOOP, false }.push(*this);
       return true;
     }
 
@@ -470,7 +737,7 @@ namespace dxup {
       const DX9Operand* dst = operation.getOperandByType(optype::Dst);
       const DX9Operand* vec4 = operation.getOperandByType(boolean ? optype::Bool : optype::Vec4);
 
-      RegisterMapping mapping;
+      RegisterMapping mapping{};
       mapping.dx9Id = dst->getRegNumber();
       mapping.dx9Type = dst->getRegType();
       uint32_t data[4];

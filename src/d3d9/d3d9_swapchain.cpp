@@ -16,6 +16,7 @@ namespace dxup {
   HRESULT Direct3DSwapChain9Ex::Reset(D3DPRESENT_PARAMETERS* parameters) {
     CriticalSection cs(m_device);
 
+
     // Get info and crap!
     UINT bufferCount = std::max(1u, parameters->BackBufferCount);
 
@@ -276,6 +277,7 @@ namespace dxup {
 
   HRESULT Direct3DSwapChain9Ex::PresentD3D11(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion, DWORD dwFlags, UINT d3d11Flags, bool ex) {
     HRESULT result;
+
 
     if (hDestWindowOverride != nullptr)
       return log::d3derr(D3DERR_INVALIDCALL, "PresentD3D11: called with window override. Not presenting.");

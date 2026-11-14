@@ -1,6 +1,9 @@
 #include "d3d9_state.h"
 #include "d3d9_util.h"
 #include "d3d9_texture.h"
+#include "d3d9_matrix_math.h"
+#include <cstring>
+#include <initializer_list>
 
 namespace dxup {
 
@@ -19,9 +22,174 @@ namespace dxup {
     std::memset(textures.data(), 0, sizeof(IDirect3DBaseTexture9*) * textures.size());
     std::memset(vertexOffsets.data(), 0, sizeof(UINT) * vertexOffsets.size());
     std::memset(vertexStrides.data(), 0, sizeof(UINT) * vertexStrides.size());
+    streamFrequencies.fill(1u);
 
+    ResetFixedFunctionState();
     if (stateBlockType != 0)
       this->capture(stateBlockType, false);
+  }
+
+  D3D9State::~D3D9State() {
+    // Texture stage bindings use manual private COM reference counting.
+    // Without this, destroying a state block or a device leaks its textures.
+    for (IDirect3DBaseTexture9* texture : textures) {
+      if (!texture)
+        continue;
+      switch (texture->GetType()) {
+      case D3DRTYPE_TEXTURE:
+        reinterpret_cast<Direct3DTexture9*>(texture)->ReleasePrivate();
+        break;
+      case D3DRTYPE_CUBETEXTURE:
+        reinterpret_cast<Direct3DCubeTexture9*>(texture)->ReleasePrivate();
+        break;
+      case D3DRTYPE_VOLUMETEXTURE:
+        reinterpret_cast<Direct3DVolumeTexture9*>(texture)->ReleasePrivate();
+        break;
+      default:
+        break;
+      }
+    }
+  }
+
+  static bool validTransform(D3DTRANSFORMSTATETYPE state) {
+    return matrix_math::validTransformIndex(static_cast<DWORD>(state));
+  }
+
+  void D3D9State::ResetFixedFunctionState() {
+    transforms.clear();
+    lights.clear();
+    material = {};
+    material.Diffuse.r = material.Diffuse.g = material.Diffuse.b = material.Diffuse.a = 1.0f;
+    material.Ambient.r = material.Ambient.g = material.Ambient.b = material.Ambient.a = 1.0f;
+    materialCaptured = false;
+    clipPlanes = {};
+    clipPlaneCaptured = {};
+  }
+
+  HRESULT D3D9State::SetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
+    if (!matrix || !validTransform(state)) return D3DERR_INVALIDCALL;
+    transforms[static_cast<DWORD>(state)] = *matrix;
+    return D3D_OK;
+  }
+  HRESULT D3D9State::GetTransform(D3DTRANSFORMSTATETYPE state, D3DMATRIX* matrix) {
+    if (!matrix || !validTransform(state)) return D3DERR_INVALIDCALL;
+    auto it = transforms.find(static_cast<DWORD>(state));
+    if (it != transforms.end()) *matrix = it->second;
+    else matrix_math::identity(matrix->m);
+    return D3D_OK;
+  }
+  HRESULT D3D9State::MultiplyTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix) {
+    if (!matrix || !validTransform(state)) return D3DERR_INVALIDCALL;
+    D3DMATRIX current;
+    GetTransform(state, &current);
+    D3DMATRIX result;
+    // D3D9 specifies pMatrix * existing state, not existing state * pMatrix.
+    matrix_math::multiply(matrix->m, current.m, result.m);
+    return SetTransform(state, &result);
+  }
+  HRESULT D3D9State::SetMaterial(const D3DMATERIAL9* value) {
+    if (!value) return D3DERR_INVALIDCALL;
+    material = *value;
+    materialCaptured = true;
+    return D3D_OK;
+  }
+  HRESULT D3D9State::GetMaterial(D3DMATERIAL9* value) {
+    if (!value) return D3DERR_INVALIDCALL;
+    *value = material;
+    return D3D_OK;
+  }
+  HRESULT D3D9State::SetLight(DWORD index, const D3DLIGHT9* value) {
+    if (!value) return D3DERR_INVALIDCALL;
+    if (value->Type != D3DLIGHT_POINT && value->Type != D3DLIGHT_SPOT && value->Type != D3DLIGHT_DIRECTIONAL)
+      return D3DERR_INVALIDCALL;
+    auto& entry = lights[index];
+    entry.parameters = *value;
+    entry.parametersCaptured = true;
+    return D3D_OK;
+  }
+  HRESULT D3D9State::GetLight(DWORD index, D3DLIGHT9* value) {
+    if (!value) return D3DERR_INVALIDCALL;
+    auto it = lights.find(index);
+    if (it == lights.end() || !it->second.parametersCaptured) return D3DERR_INVALIDCALL;
+    *value = it->second.parameters;
+    return D3D_OK;
+  }
+  HRESULT D3D9State::LightEnable(DWORD index, BOOL enabled) {
+    auto& entry = lights[index];
+    if (!entry.parametersCaptured && m_device->GetLiveState() == this) {
+      // A live device creates a default directional light on first enable.
+      // A BeginStateBlock recorder only captures the enable bit: it must not
+      // overwrite the live light definition when the block is later applied.
+      entry.parameters = {};
+      entry.parameters.Type = D3DLIGHT_DIRECTIONAL;
+      entry.parameters.Diffuse.r = entry.parameters.Diffuse.g = entry.parameters.Diffuse.b = 1.0f;
+      entry.parameters.Direction.z = 1.0f;
+      entry.parametersCaptured = true;
+    }
+    entry.enabled = enabled ? TRUE : FALSE;
+    entry.enabledCaptured = true;
+    return D3D_OK;
+  }
+  HRESULT D3D9State::GetLightEnable(DWORD index, BOOL* enabled) {
+    if (!enabled) return D3DERR_INVALIDCALL;
+    auto it = lights.find(index);
+    if (it == lights.end()) return D3DERR_INVALIDCALL;
+    *enabled = it->second.enabled;
+    return D3D_OK;
+  }
+  HRESULT D3D9State::SetClipPlane(DWORD index, const float* plane) {
+    if (!plane || index >= clipPlanes.size()) return D3DERR_INVALIDCALL;
+    for (size_t c = 0; c < 4; ++c) clipPlanes[index][c] = plane[c];
+    clipPlaneCaptured[index] = true;
+    return D3D_OK;
+  }
+  HRESULT D3D9State::GetClipPlane(DWORD index, float* plane) {
+    if (!plane || index >= clipPlanes.size()) return D3DERR_INVALIDCALL;
+    for (size_t c = 0; c < 4; ++c) plane[c] = clipPlanes[index][c];
+    return D3D_OK;
+  }
+  void D3D9State::captureFixedFunction(bool recapture) {
+    const D3D9State* live = m_device->GetLiveState();
+    if (!recapture) {
+      // Capture the full fixed-function vertex state for typed blocks.
+      for (DWORD s : {static_cast<DWORD>(D3DTS_VIEW), static_cast<DWORD>(D3DTS_PROJECTION)}) {
+        D3DMATRIX value;
+        m_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(s), &value);
+        transforms[s] = value;
+      }
+      for (DWORD i = 0; i < 8; ++i) {
+        DWORD s = D3DTS_TEXTURE0 + i;
+        D3DMATRIX value;
+        m_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(s), &value);
+        transforms[s] = value;
+      }
+      for (DWORD i = 0; i < 256; ++i) {
+        DWORD s = D3DTS_WORLD + i;
+        D3DMATRIX value;
+        m_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(s), &value);
+        transforms[s] = value;
+      }
+      lights = live->lights;
+    } else {
+      for (auto& transform : transforms)
+        m_device->GetTransform(static_cast<D3DTRANSFORMSTATETYPE>(transform.first), &transform.second);
+      for (auto& light : lights) {
+        auto current = live->lights.find(light.first);
+        if (current == live->lights.end()) continue;
+        if (light.second.parametersCaptured) light.second.parameters = current->second.parameters;
+        if (light.second.enabledCaptured) light.second.enabled = current->second.enabled;
+      }
+    }
+    if (!recapture || materialCaptured) {
+      m_device->GetMaterial(&material);
+      materialCaptured = true;
+    }
+    for (DWORD i = 0; i < clipPlanes.size(); ++i) {
+      if (!recapture || clipPlaneCaptured[i]) {
+        m_device->GetClipPlane(i, clipPlanes[i].data());
+        clipPlaneCaptured[i] = true;
+      }
+    }
   }
 
   void D3D9State::capture(uint32_t stateBlockType, bool recapture) {
@@ -29,9 +197,17 @@ namespace dxup {
     // Idea taken from SwiftShader. May or may not be accurate.
     for (uint32_t i = 0; i < 2; i++) {
       D3D9ShaderConstants& constants = i == 0 ? vsConstants : psConstants;
-      std::memset(constants.floatConstants.data(), 0x80000000, sizeof(constants.floatConstants));
-      std::memset(constants.intConstants.data(), 0x80000000, sizeof(constants.intConstants));
-      std::memset(constants.boolConstants.data(), 0x80000000, sizeof(constants.boolConstants));
+      // memset takes an 8-bit byte, so memset(..., 0x80000000, ...) actually
+      // writes zeros and breaks state-block shader-constant capture tracking.
+      const uint32_t uncaptured = 0x80000000u;
+      for (auto& value : constants.floatConstants)
+        for (auto& component : value.data)
+          std::memcpy(&component, &uncaptured, sizeof(uncaptured));
+      for (auto& value : constants.intConstants)
+        for (auto& component : value.data)
+          std::memcpy(&component, &uncaptured, sizeof(uncaptured));
+      for (auto& value : constants.boolConstants)
+        std::memcpy(&value, &uncaptured, sizeof(uncaptured));
     }
 
     if (stateBlockType == D3DSBT_PIXELSTATE || stateBlockType == D3DSBT_ALL)
@@ -48,6 +224,7 @@ namespace dxup {
       this->captureVertexTextureStates(recapture);
       this->captureVertexShaderStates(recapture);
       this->captureVertexDeclaration(recapture);
+      this->captureFixedFunction(recapture);
     }
     if (stateBlockType == D3DSBT_ALL)   // Capture remaining states
     {
@@ -62,6 +239,15 @@ namespace dxup {
     }
   }
   void D3D9State::apply() {
+    for (const auto& transform : transforms)
+      m_device->SetTransform(static_cast<D3DTRANSFORMSTATETYPE>(transform.first), &transform.second);
+    if (materialCaptured) m_device->SetMaterial(&material);
+    for (const auto& light : lights) {
+      if (light.second.parametersCaptured) m_device->SetLight(light.first, &light.second.parameters);
+      if (light.second.enabledCaptured) m_device->LightEnable(light.first, light.second.enabled);
+    }
+    for (DWORD i = 0; i < clipPlanes.size(); ++i)
+      if (clipPlaneCaptured[i]) m_device->SetClipPlane(i, clipPlanes[i].data());
     if (viewportCaptured)
       m_device->SetViewport(&viewport);
 
@@ -80,6 +266,8 @@ namespace dxup {
     for (uint32_t i = 0; i < 16; i++) {
       if (vertexBufferCaptures[i])
         m_device->SetStreamSource(i, vertexBuffers[i].ptr(), vertexOffsets[i], vertexStrides[i]);
+      if (streamFrequencyCaptures[i])
+        m_device->SetStreamSourceFreq(i, streamFrequencies[i]);
     }
 
     for (uint32_t i = 0; i < renderState.size(); i++) {
@@ -93,8 +281,18 @@ namespace dxup {
         convert::mapStageToSampler(i, &internalSampler);
 
         if (samplerStateCaptures[internalSampler][j])
-          m_device->SetSamplerState(i, (D3DSAMPLERSTATETYPE)j, renderState[j]);
+          m_device->SetSamplerState(i, (D3DSAMPLERSTATETYPE)j, samplerStates[internalSampler][j]);
       }
+    });
+
+    // State blocks must restore texture bindings as well as sampler state.
+    // `textures` and `textureCaptured` are indexed by the internal 0..19
+    // sampler index; SetTexture expects the public D3D9 stage identifier.
+    forEachSampler([&](uint32_t stage) {
+      uint32_t internalStage = 0;
+      if (SUCCEEDED(convert::mapStageToSampler(stage, &internalStage)) &&
+          textureCaptured[internalStage])
+        m_device->SetTexture(stage, textures[internalStage]);
     });
 
     for (uint32_t i = 0; i < textureStageStates.size(); i++) {
@@ -161,6 +359,12 @@ namespace dxup {
 
     return D3D_OK;
   }
+  void D3D9State::MarkTextureLODDirty(IDirect3DBaseTexture9* texture) {
+    for (uint32_t i = 0; i < textures.size(); ++i)
+      if (textures[i] == texture)
+        dirtySamplers |= (1u << i);
+  }
+
   HRESULT D3D9State::SetTexture(DWORD Stage, IDirect3DBaseTexture9* pTexture) {
     HRESULT result = convert::mapStageToSampler(Stage, &Stage);
     if (FAILED(result))
@@ -169,12 +373,19 @@ namespace dxup {
     if (textures[Stage] == pTexture)
       return D3D_OK;
 
+    if (pTexture != nullptr &&
+        pTexture->GetType() != D3DRTYPE_TEXTURE &&
+        pTexture->GetType() != D3DRTYPE_CUBETEXTURE &&
+        pTexture->GetType() != D3DRTYPE_VOLUMETEXTURE)
+      return D3DERR_INVALIDCALL;
+
     IDirect3DBaseTexture9* currentBinding = textures[Stage];
 
     if (currentBinding != nullptr) {
       switch (textures[Stage]->GetType()) {
       case D3DRTYPE_TEXTURE: reinterpret_cast<Direct3DTexture9*>(currentBinding)->ReleasePrivate(); break;
       case D3DRTYPE_CUBETEXTURE: reinterpret_cast<Direct3DCubeTexture9*>(currentBinding)->ReleasePrivate(); break;
+      case D3DRTYPE_VOLUMETEXTURE: reinterpret_cast<Direct3DVolumeTexture9*>(currentBinding)->ReleasePrivate(); break;
       default:
         log::warn("Unable to find what texture stage really is to release internally.");
         break;
@@ -196,11 +407,14 @@ namespace dxup {
         break;
       }
 
-      default: {
-        textures[Stage] = nullptr;
-        log::warn("Unable to find what new texture to bind really is.");
+      case D3DRTYPE_VOLUMETEXTURE: {
+        Direct3DVolumeTexture9* tex = reinterpret_cast<Direct3DVolumeTexture9*>(pTexture);
+        tex->AddRefPrivate();
         break;
       }
+
+      default: // Rejected above.
+        return D3DERR_INVALIDCALL;
 
       }
     }
@@ -208,6 +422,7 @@ namespace dxup {
     textureCaptured[Stage] = true;
     textures[Stage] = pTexture;
     dirtyFlags |= dirtyFlags::textures;
+    dirtySamplers |= (1u << Stage); // The new texture may have a different managed LOD.
     return D3D_OK;
   }
 
@@ -217,7 +432,7 @@ namespace dxup {
     if (ppRenderTarget == nullptr)
       return log::d3derr(D3DERR_INVALIDCALL, "GetRenderTarget: ppRenderTarget was nullptr.");
 
-    if (RenderTargetIndex > renderTargets.size())
+    if (RenderTargetIndex >= renderTargets.size())
       return log::d3derr(D3DERR_INVALIDCALL, "GetRenderTarget: rendertarget index out of bounds (%d).", RenderTargetIndex);
 
     if (renderTargets[RenderTargetIndex] == nullptr)
@@ -310,10 +525,12 @@ namespace dxup {
     if (State == D3DRS_CULLMODE ||
       State == D3DRS_DEPTHBIAS ||
       State == D3DRS_FILLMODE ||
+      State == D3DRS_ANTIALIASEDLINEENABLE ||
       State == D3DRS_SCISSORTESTENABLE ||
       State == D3DRS_SLOPESCALEDEPTHBIAS)
       dirtyFlags |= dirtyFlags::rasterizer;
-    else if (State == D3DRS_CCW_STENCILZFAIL ||
+    else if (State == D3DRS_TWOSIDEDSTENCILMODE ||
+      State == D3DRS_CCW_STENCILZFAIL ||
       State == D3DRS_CCW_STENCILFAIL ||
       State == D3DRS_CCW_STENCILPASS ||
       State == D3DRS_CCW_STENCILFUNC ||
@@ -349,8 +566,15 @@ namespace dxup {
       dirtyFlags |= dirtyFlags::blendState;
     else if (State == D3DRS_SRGBWRITEENABLE)
       dirtyFlags |= dirtyFlags::renderTargets;
-    else
-      log::warn("Unhandled render state: %lu", State);
+    else {
+      // Some games toggle unsupported states hundreds of thousands of times.
+      // Preserve a clear compatibility diagnostic without flooding logs.
+      static bool warnedStates[D3DRS_BLENDOPALPHA + 1] = {};
+      if (!warnedStates[State]) {
+        warnedStates[State] = true;
+        log::warn("Unhandled render state: %lu (subsequent changes suppressed)", State);
+      }
+    }
 
     return D3D_OK;
   }
@@ -571,6 +795,31 @@ namespace dxup {
 
     return D3D_OK;
   }
+  HRESULT D3D9State::SetStreamSourceFreq(UINT StreamNumber, UINT Setting) {
+    if (StreamNumber >= streamFrequencies.size())
+      return D3DERR_INVALIDCALL;
+    const UINT flags = Setting & (D3DSTREAMSOURCE_INDEXEDDATA | D3DSTREAMSOURCE_INSTANCEDATA);
+    const UINT frequency = Setting & 0x3fffffffu;
+    if (frequency == 0 || flags == (D3DSTREAMSOURCE_INDEXEDDATA | D3DSTREAMSOURCE_INSTANCEDATA))
+      return D3DERR_INVALIDCALL;
+    if ((flags == D3DSTREAMSOURCE_INDEXEDDATA && StreamNumber != 0) ||
+        (flags == D3DSTREAMSOURCE_INSTANCEDATA && StreamNumber == 0))
+      return D3DERR_INVALIDCALL;
+    streamFrequencyCaptures[StreamNumber] = true;
+    if (streamFrequencies[StreamNumber] != Setting) {
+      streamFrequencies[StreamNumber] = Setting;
+      dirtyFlags |= dirtyFlags::vertexDecl;
+    }
+    return D3D_OK;
+  }
+
+  HRESULT D3D9State::GetStreamSourceFreq(UINT StreamNumber, UINT* pSetting) {
+    if (StreamNumber >= streamFrequencies.size() || pSetting == nullptr)
+      return D3DERR_INVALIDCALL;
+    *pSetting = streamFrequencies[StreamNumber];
+    return D3D_OK;
+  }
+
   HRESULT D3D9State::SetStreamSource(UINT StreamNumber, IDirect3DVertexBuffer9* pStreamData, UINT OffsetInBytes, UINT Stride) {
     if (StreamNumber >= 16)
       return log::d3derr(D3DERR_INVALIDCALL, "SetStreamSource: stream number was out of bounds (range: 0-15, got: %d).", StreamNumber);
@@ -995,6 +1244,11 @@ namespace dxup {
       UINT stride;
       m_device->GetStreamSource(i, &tempBuffer, &offset, &stride);
       SetStreamSource(i, tempBuffer.ptr(), offset, stride);
+      UINT frequency = 1;
+      if (SUCCEEDED(m_device->GetStreamSourceFreq(i, &frequency))) {
+        streamFrequencyCaptures[i] = true;
+        SetStreamSourceFreq(i, frequency);
+      }
     }
   }
 

@@ -3,6 +3,7 @@
 #include "d3d9_base.h"
 #include "d3d9_device_unknown.h"
 #include <vector>
+#include <array>
 #include "../dx9asm/dx9asm_translator.h"
 
 namespace dxup {
@@ -10,6 +11,7 @@ namespace dxup {
   struct InputLink {
     Com<ID3D11InputLayout> inputLayout;
     Com<IDirect3DVertexDeclaration9> vertexDcl;
+    std::array<UINT, 16> instanceStepRates = {};
   };
 
   template <typename D3D11Shader, typename Base>
@@ -71,16 +73,18 @@ namespace dxup {
       return m_shader.ptr();
     }
 
-    void LinkInput(ID3D11InputLayout* inputLayout, IDirect3DVertexDeclaration9* vertDcl) {
-      m_inputLinks.push_back(InputLink{ inputLayout, vertDcl });
+    void LinkInput(ID3D11InputLayout* inputLayout, IDirect3DVertexDeclaration9* vertDcl,
+                   const std::array<UINT, 16>& stepRates) {
+      m_inputLinks.push_back(InputLink{ inputLayout, vertDcl, stepRates });
     }
 
-    ID3D11InputLayout* GetLinkedInput(IDirect3DVertexDeclaration9* vertDcl) {
+    ID3D11InputLayout* GetLinkedInput(IDirect3DVertexDeclaration9* vertDcl,
+                                       const std::array<UINT, 16>& stepRates) {
       if (vertDcl == nullptr)
         return nullptr;
 
       for (InputLink& link : m_inputLinks) {
-        if (link.vertexDcl == vertDcl)
+        if (link.vertexDcl == vertDcl && link.instanceStepRates == stepRates)
           return link.inputLayout.ptr();
       }
 

@@ -25,7 +25,7 @@ namespace dxup {
         setRepresentation(1, D3D10_SB_OPERAND_INDEX_IMMEDIATE32_PLUS_RELATIVE);
 
         uint32_t dx9Swizzle = operand.getRelativeAddrSwizzle(state.getMajorVersion());
-        const RegisterMapping* address = state.getRegisterMap().lookupOrCreateRegisterMapping(state, D3DSPR_ADDR, operand.getRelativeAddrIndex(state.getMajorVersion()), calcReadMask(dx9Swizzle, 1), 0, false );
+        const RegisterMapping* address = state.getRegisterMap().lookupOrCreateRegisterMapping(state, operand.getRelativeAddrType(state.getMajorVersion()), operand.getRelativeAddrIndex(state.getMajorVersion()), calcReadMask(dx9Swizzle, 1), 0, false );
         m_relativeIndex = address->dxbcOperand.getRegNumber();
 
         if (dx9Swizzle & D3DVS_X_Y)
@@ -53,7 +53,7 @@ namespace dxup {
           uint32_t shift = i * 2;
           uint32_t mask = 0b0011u << shift;
           uint32_t swizzleIndex = (dx9Swizzle & mask) >> shift;
-          uint32_t modifier = operand.getModifier();
+          const uint32_t modifier = operand.getModifier();
           switch (modifier) {
           default:
             log::fail("Unimplemented operand modifier!");

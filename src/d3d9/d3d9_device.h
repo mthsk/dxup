@@ -159,6 +159,8 @@ namespace dxup {
     void GetParent(Direct3D9Ex** parent);
     ID3D11DeviceContext* GetContext();
     ID3D11Device* GetD3D11Device();
+    void MarkTextureLODDirty(IDirect3DBaseTexture9* texture);
+    const D3D9State* GetLiveState() const { return m_state; }
 
     static HRESULT Create(
       UINT adapter,
@@ -236,7 +238,6 @@ namespace dxup {
     };
 
     PendingCursorUpdate m_pendingCursorUpdate = { 0 };
-    DWORD m_fvf = 0;
     BOOL m_softwareVertexProcessing = 0;
 
     D3D9ImmediateRenderer* m_renderer;

@@ -32,6 +32,13 @@ namespace dxup {
       { D3DFMT_A8B8G8R8, DXGI_FORMAT_R8G8B8A8_UNORM },
       { D3DFMT_A8B8G8R8, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB },
       { D3DFMT_A2B10G10R10, DXGI_FORMAT_R10G10B10A2_UNORM },
+      // Approximate D3DFMT_A2R10G10B10 (RGB10 with reversed R/B packed bits)
+      // using D3D11's only native packed 10:10:10:2 UNORM render-target
+      // format. This is suitable for GPU render-to-texture / sampling, but
+      // NOT byte-for-byte equivalent for CPU LockRect, readback, or data
+      // supplied in native D3D9 A2R10G10B10 layout: those require R/B
+      // bitfield conversion, which DXUP does not yet implement.
+      { D3DFMT_A2R10G10B10, DXGI_FORMAT_R10G10B10A2_UNORM },
       { D3DFMT_X8R8G8B8, DXGI_FORMAT_B8G8R8X8_TYPELESS },
       { D3DFMT_X8R8G8B8, DXGI_FORMAT_B8G8R8X8_UNORM },
       { D3DFMT_X8R8G8B8, DXGI_FORMAT_B8G8R8X8_UNORM_SRGB },
@@ -86,7 +93,9 @@ namespace dxup {
       { D3DFMT_D16, DXGI_FORMAT_D16_UNORM },
       { D3DFMT_DF24, DXGI_FORMAT_D32_FLOAT },
       { D3DFMT_DF16, DXGI_FORMAT_D32_FLOAT },
-      //{ D3DFMT_INTZ, DXGI_FORMAT_D32_FLOAT },
+      // INTZ is a vendor D3D9 depth texture: keep its storage typeless so
+      // we can create both D24S8 depth views and depth-only shader views.
+      { D3DFMT_INTZ, DXGI_FORMAT_R24G8_TYPELESS },
       { D3DFMT_S8_LOCKABLE, DXGI_FORMAT_D24_UNORM_S8_UINT }, // No stencil-only formats :/
       { D3DFMT_D16_LOCKABLE, DXGI_FORMAT_D16_UNORM },
       { D3DFMT_D32F_LOCKABLE, DXGI_FORMAT_D32_FLOAT },
@@ -99,7 +108,7 @@ namespace dxup {
       DXGI_FORMAT dxgiFormat =  formatConverter.toJ(Format);
 
       if (Format != D3DFMT_UNKNOWN && dxgiFormat == DXGI_FORMAT_UNKNOWN)
-        log::warn("format: D3DFORMAT %d became DXGI_FORMAT_UNKNOWN.");
+        log::warn("format: D3DFORMAT %u (0x%08x) became DXGI_FORMAT_UNKNOWN.", static_cast<unsigned>(Format), static_cast<unsigned>(Format));
 
       return dxgiFormat;
     }
@@ -160,7 +169,7 @@ namespace dxup {
           format == DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM)
         return format;
 
-      log::warn("makeSwapchainCompliant: format %d was not in the swapchain whitelist. Falling back to DXGI_FORMAT_B8G8R8A8_UNORM...");
+      log::warn("makeSwapchainCompliant: format %u was not in the swapchain whitelist. Falling back to DXGI_FORMAT_B8G8R8A8_UNORM...", static_cast<unsigned>(format));
 
       return DXGI_FORMAT_B8G8R8A8_UNORM;
     }

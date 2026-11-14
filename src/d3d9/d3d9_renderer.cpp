@@ -1,10 +1,21 @@
 #include "d3d9_renderer.h"
+#include <cmath>
 #include "d3d9_texture.h"
+#include "d3d9_mipmap.h"
+#include "d3d9_matrix_math.h"
+#include "d3d9_fixed_function.h"
+#include "d3d9_trianglefan.h"
+#include "../util/d3dcompiler_helpers.h"
 #include "d3d9_util.h"
 #include "shaders/blit.vs.dxbc.h"
 #include "shaders/blit.ps.dxbc.h"
 
 #include <cfloat>
+#include <vector>
+#include <string>
+#include <cstring>
+#include <limits>
+#include <cstdlib>
 
 namespace dxup {
 
@@ -15,10 +26,9 @@ namespace dxup {
     , m_upVertexBuffer{ device, D3D11_BIND_VERTEX_BUFFER }
     , m_upIndexBuffer{ device, D3D11_BIND_INDEX_BUFFER }
     , m_fanIndexBuffer{ device, D3D11_BIND_INDEX_BUFFER }
-    , m_fanIndexed{ false }
     , m_vsConstants{ device, context }
     , m_psConstants{ device, context } {
-  
+
     D3D11_SAMPLER_DESC blitSampler;
     blitSampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     blitSampler.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -37,6 +47,16 @@ namespace dxup {
     if (FAILED(result))
       log::warn("D3D9ImmediateRenderer: failed to create blit sampler state.");
 
+    D3D11_BUFFER_DESC ffBufferDesc = {};
+    ffBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    ffBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ffBufferDesc.ByteWidth = sizeof(FFVertexConstants);
+    result = m_device->CreateBuffer(&ffBufferDesc, nullptr, &m_ffVertexBuffer);
+    if (FAILED(result)) log::warn("Failed to allocate fixed-function VS constants.");
+    ffBufferDesc.ByteWidth = sizeof(FFPixelConstants);
+    result = m_device->CreateBuffer(&ffBufferDesc, nullptr, &m_ffPixelBuffer);
+    if (FAILED(result)) log::warn("Failed to allocate fixed-function PS constants.");
+
     result = m_device->CreateVertexShader(g_blit_vs, sizeof(g_blit_vs), nullptr, &m_blitVS);
     if (FAILED(result))
       log::warn("D3D9ImmediateRenderer: failed to create blit vs.");
@@ -47,6 +67,7 @@ namespace dxup {
   }
 
   void D3D9ImmediateRenderer::endFrame() {
+
     m_fanIndexBuffer.endFrame();
     m_upIndexBuffer.endFrame();
     m_upVertexBuffer.endFrame();
@@ -56,16 +77,41 @@ namespace dxup {
   }
 
   HRESULT D3D9ImmediateRenderer::Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) {
-    if (Count >= 1) {
-      bool fullRectClear = pRects->x1 == 0 &&
-                           pRects->x2 == (LONG) m_state->viewport.Width &&
-                           pRects->y1 == 0 &&
-                           pRects->y2 == (LONG) m_state->viewport.Height;
-        
-      if (!fullRectClear) {
-        log::warn("Clear called with rects. Discarding clear.");
-        return D3D_OK;
+
+    // D3D9 supports rectangle-scoped clears. D3D11 ClearRenderTargetView does
+    // not, but ID3D11DeviceContext1::ClearView does for color render targets.
+    // Do not silently clear the *entire* depth/stencil buffer when rectangles
+    // were requested: depth/stencil rectangle clears need a separate draw path.
+    if (Count && !pRects)
+      return log::d3derr(D3DERR_INVALIDCALL, "Clear: Count > 0, pRects is nullptr.");
+
+    // A one-rect full-surface clear can still take the fast D3D11 depth/stencil
+    // path. Check the target dimensions, not just the viewport size.
+    bool fullSurfaceRect = false;
+    if (Count == 1 && m_state->renderTargets[0] != nullptr) {
+      D3DSURFACE_DESC target = {};
+      if (SUCCEEDED(m_state->renderTargets[0]->GetDesc(&target)))
+        fullSurfaceRect = pRects[0].x1 == 0 && pRects[0].y1 == 0 &&
+          pRects[0].x2 == static_cast<LONG>(target.Width) &&
+          pRects[0].y2 == static_cast<LONG>(target.Height);
+    }
+    const bool partialClear = Count != 0 && !fullSurfaceRect;
+    if (partialClear && (Flags & (D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL))) {
+      log::warn("Clear: partial depth/stencil clear is not implemented.");
+      return D3DERR_INVALIDCALL;
+    }
+
+    std::vector<D3D11_RECT> rects;
+    if (partialClear) {
+      rects.reserve(Count);
+      for (DWORD i = 0; i < Count; ++i) {
+        const D3DRECT& r = pRects[i];
+        if (r.x2 <= r.x1 || r.y2 <= r.y1)
+          continue;
+        rects.push_back({ r.x1, r.y1, r.x2, r.y2 });
       }
+      if (rects.empty())
+        return D3D_OK;
     }
 
     FLOAT color[4];
@@ -83,8 +129,12 @@ namespace dxup {
           continue;
 
         ID3D11RenderTargetView* rtv = m_state->renderTargets[i]->GetD3D11RenderTarget(m_state->renderState[D3DRS_SRGBWRITEENABLE] == TRUE);
-        if (rtv)
-          m_context->ClearRenderTargetView(rtv, color);
+        if (rtv) {
+          if (partialClear)
+            m_context->ClearView(rtv, color, rects.data(), static_cast<UINT>(rects.size()));
+          else
+            m_context->ClearRenderTargetView(rtv, color);
+        }
       }
     }
 
@@ -101,91 +151,110 @@ namespace dxup {
     return D3D_OK;
   }
 
-  HRESULT D3D9ImmediateRenderer::drawTriangleFan(bool indexed, D3DPRIMITIVETYPE PrimitiveType, UINT StartIndex, UINT PrimitiveCount, UINT BaseVertexIndex) {
-    const uint32_t newPrimitiveCount = PrimitiveCount * 3;
-    const uint32_t length = newPrimitiveCount * sizeof(uint16_t);
-
-    m_fanIndexBuffer.reserve(length);
-
-    uint16_t* data = nullptr;
-    m_fanIndexBuffer.map(m_context, (void**)&data, length);
-
-    if (indexed && m_state->indexBuffer != nullptr) {
-      D3D11_MAPPED_SUBRESOURCE res;
-      ID3D11Resource* originalIndexBuffer = m_state->indexBuffer->GetDXUPResource()->GetStaging();
-      m_context->Map(originalIndexBuffer, 0, D3D11_MAP_READ, 0, &res);
-
-      uint16_t* originalIndices = reinterpret_cast<uint16_t*>(res.pData);
-
-      for (UINT i = 0; i < PrimitiveCount; i++) {
-        data[3 * i + 0] = originalIndices[StartIndex + i + 1];
-        data[3 * i + 1] = originalIndices[StartIndex + i + 2];
-        data[3 * i + 2] = originalIndices[StartIndex + 0];
-      }
-
-      m_context->Unmap(originalIndexBuffer, 0);
+  HRESULT D3D9ImmediateRenderer::drawTriangleFan(bool indexed, UINT StartIndex,
+      UINT PrimitiveCount, INT BaseVertexIndex, const void* userIndices, D3DFORMAT indexFormat) {
+    const void* indices = userIndices;
+    uint32_t indexCount = PrimitiveCount + 2u;
+    bool indices32 = indexFormat == D3DFMT_INDEX32;
+    ID3D11Resource* staging = nullptr;
+    bool mapped = false;
+    if (indexed && !userIndices) {
+      if (m_state->indexBuffer == nullptr) return D3DERR_INVALIDCALL;
+      auto* resource = m_state->indexBuffer->GetDXUPResource();
+      staging = resource->GetStaging();
+      if (!staging) return D3DERR_INVALIDCALL;
+      D3DINDEXBUFFER_DESC desc = {};
+      if (FAILED(m_state->indexBuffer->GetDesc(&desc))) return D3DERR_INVALIDCALL;
+      indices32 = desc.Format == D3DFMT_INDEX32;
+      if (!indices32 && desc.Format != D3DFMT_INDEX16) return D3DERR_INVALIDCALL;
+      indexCount = desc.Size / (indices32 ? 4u : 2u);
+      if (StartIndex > indexCount || PrimitiveCount > indexCount - StartIndex ||
+          indexCount - StartIndex < 2u) return D3DERR_INVALIDCALL;
+      // Index buffer contents may have been modified on the GPU.
+      m_context->CopyResource(staging, resource->GetResource());
+      D3D11_MAPPED_SUBRESOURCE mappedIndices = {};
+      if (FAILED(m_context->Map(staging, 0, D3D11_MAP_READ, 0, &mappedIndices)))
+        return D3DERR_INVALIDCALL;
+      indices = mappedIndices.pData;
+      mapped = true;
     }
-    else {
-      for (UINT i = 0; i < PrimitiveCount; i++) {
-        data[3 * i + 0] = i + 1;
-        data[3 * i + 1] = i + 2;
-        data[3 * i + 2] = 0;
-      }
-    }
+    std::vector<uint32_t> fan;
+    const bool valid = trianglefan::expand(PrimitiveCount,
+      indexed ? indices : nullptr, indexCount, indexed ? StartIndex : 0,
+      indices32, fan);
+    if (mapped) m_context->Unmap(staging, 0);
+    if (!valid) return D3DERR_INVALIDCALL;
+    if (fan.empty()) { postDraw(); return D3D_OK; }
 
-    uint32_t offset = m_fanIndexBuffer.unmap(m_context, length);
-
-    m_fanIndexed = indexed;
-
-    m_context->IASetIndexBuffer(m_fanIndexBuffer.getBuffer(), DXGI_FORMAT_R16_UINT, offset);
-    HRESULT result = DrawIndexedPrimitive(D3DPT_TRIANGLELIST, BaseVertexIndex, 0, PrimitiveCount + 2, 0, newPrimitiveCount);
+    const UINT bytes = static_cast<UINT>(fan.size() * sizeof(uint32_t));
+    m_fanIndexBuffer.reserve(bytes);
+    if (!m_fanIndexBuffer.getBuffer()) return D3DERR_INVALIDCALL;
+    const UINT offset = m_fanIndexBuffer.update(m_context, fan.data(), bytes);
+    ID3D11Buffer* buffer = m_fanIndexBuffer.getBuffer();
+    m_context->IASetIndexBuffer(buffer, DXGI_FORMAT_R32_UINT, offset);
+    m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const UINT instanceCount = getInstanceCount();
+    if (instanceCount)
+      m_context->DrawIndexedInstanced(static_cast<UINT>(fan.size()), instanceCount, 0, BaseVertexIndex, 0);
+    else
+      m_context->DrawIndexed(static_cast<UINT>(fan.size()), 0, BaseVertexIndex);
     m_state->dirtyFlags |= dirtyFlags::indexBuffer;
-    return result;
+    postDraw();
+    return D3D_OK;
   }
 
   HRESULT D3D9ImmediateRenderer::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) {
+
     if (!preDraw()) {
-      log::warn("Invalid internal render state achieved.");
       postDraw();
-      return D3D_OK; // Lies!
+      return D3DERR_INVALIDCALL; // Unsupported shader/declaration combination.
     }
 
     if (PrimitiveType == D3DPT_TRIANGLEFAN)
-      return this->drawTriangleFan(false, PrimitiveType, 0, PrimitiveCount, StartVertex);
+      return this->drawTriangleFan(false, 0, PrimitiveCount, StartVertex);
 
     D3D_PRIMITIVE_TOPOLOGY topology;
     UINT drawCount = convert::primitiveData(PrimitiveType, PrimitiveCount, topology);
 
     m_context->IASetPrimitiveTopology(topology);
-    m_context->Draw(drawCount, StartVertex);
+    const UINT instanceCount = getInstanceCount();
+    if (instanceCount) m_context->DrawInstanced(drawCount, instanceCount, StartVertex, 0);
+    else m_context->Draw(drawCount, StartVertex);
 
     postDraw();
 
     return D3D_OK;
   }
   HRESULT D3D9ImmediateRenderer::DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, CONST void* pVertexStreamZeroData, UINT VertexStreamZeroStride) {
+
     if (pVertexStreamZeroData == nullptr)
       return log::d3derr(D3DERR_INVALIDCALL, "DrawPrimitiveUP: pVertexStreamZeroData was nullptr.");
 
     if (!preDraw()) {
-      log::warn("Invalid internal render state achieved.");
       postDraw();
-      return D3D_OK; // Lies!
+      return D3DERR_INVALIDCALL; // Unsupported shader/declaration combination.
     }
+    if (VertexStreamZeroStride == 0) return D3DERR_INVALIDCALL;
+    if (PrimitiveCount == 0) { postDraw(); return D3D_OK; }
 
-    if (PrimitiveType == D3DPT_TRIANGLEFAN)
-      return this->drawTriangleFan(false, PrimitiveType, 0, PrimitiveCount, 0);
 
     D3D_PRIMITIVE_TOPOLOGY topology;
     UINT drawCount = convert::primitiveData(PrimitiveType, PrimitiveCount, topology);
+    if (drawCount > std::numeric_limits<UINT>::max() / VertexStreamZeroStride)
+      return D3DERR_INVALIDCALL;
     UINT length = drawCount * VertexStreamZeroStride;
 
     m_upVertexBuffer.reserve(length);
+    if (!m_upVertexBuffer.getBuffer()) return D3DERR_INVALIDCALL;
     uint32_t offset = m_upVertexBuffer.update(m_context, pVertexStreamZeroData, length);
 
     ID3D11Buffer* buffer = m_upVertexBuffer.getBuffer();
     m_context->IASetVertexBuffers(0, 1, &buffer, &VertexStreamZeroStride, &offset);
 
+    if (PrimitiveType == D3DPT_TRIANGLEFAN) {
+      m_state->dirtyFlags |= dirtyFlags::vertexBuffers;
+      return drawTriangleFan(false, 0, PrimitiveCount, 0);
+    }
     m_context->IASetPrimitiveTopology(topology);
     m_context->Draw(drawCount, 0);
 
@@ -196,6 +265,7 @@ namespace dxup {
     return D3D_OK;
   }
   HRESULT D3D9ImmediateRenderer::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void* pIndexData, D3DFORMAT IndexDataFormat, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) {
+
     if (pVertexStreamZeroData == nullptr)
       return log::d3derr(D3DERR_INVALIDCALL, "DrawIndexedPrimitiveUP: pVertexStreamZeroData was nullptr.");
 
@@ -203,29 +273,45 @@ namespace dxup {
       return log::d3derr(D3DERR_INVALIDCALL, "DrawIndexedPrimitiveUP: pIndexData was nullptr.");
 
     if (!preDraw()) {
-      log::warn("Invalid internal render state achieved.");
       postDraw();
-      return D3D_OK; // Lies!
+      return D3DERR_INVALIDCALL; // Unsupported shader/declaration combination.
     }
 
-    if (PrimitiveType == D3DPT_TRIANGLEFAN)
-      return this->drawTriangleFan(true, PrimitiveType, 0, PrimitiveCount, 0);
+    if (IndexDataFormat != D3DFMT_INDEX16 && IndexDataFormat != D3DFMT_INDEX32)
+      return D3DERR_INVALIDCALL;
+    if (VertexStreamZeroStride == 0) return D3DERR_INVALIDCALL;
+    if (PrimitiveCount == 0) { postDraw(); return D3D_OK; }
+
 
     D3D_PRIMITIVE_TOPOLOGY topology;
     UINT drawCount = convert::primitiveData(PrimitiveType, PrimitiveCount, topology);
+    if (MinVertexIndex > std::numeric_limits<UINT>::max() - NumVertices ||
+        MinVertexIndex + NumVertices > std::numeric_limits<UINT>::max() / VertexStreamZeroStride)
+      return D3DERR_INVALIDCALL;
     UINT length = (MinVertexIndex + NumVertices) * VertexStreamZeroStride;
 
     m_upVertexBuffer.reserve(length);
+    if (!m_upVertexBuffer.getBuffer()) return D3DERR_INVALIDCALL;
     uint32_t offset = m_upVertexBuffer.update(m_context, pVertexStreamZeroData, length);
 
     ID3D11Buffer* buffer = m_upVertexBuffer.getBuffer();
     m_context->IASetVertexBuffers(0, 1, &buffer, &VertexStreamZeroStride, &offset);
 
-    length *= IndexDataFormat == D3DFMT_INDEX32 ? 4 : 2;
+    if (PrimitiveType == D3DPT_TRIANGLEFAN) {
+      m_state->dirtyFlags |= dirtyFlags::vertexBuffers;
+      return drawTriangleFan(true, 0, PrimitiveCount, 0, pIndexData, IndexDataFormat);
+    }
 
-    m_upIndexBuffer.reserve(length);
-    m_upIndexBuffer.update(m_context, pIndexData, length);
-    m_context->IASetIndexBuffer(m_upIndexBuffer.getBuffer(), IndexDataFormat == D3DFMT_INDEX32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, 0);
+    // Index data size depends on the *index count*, not vertex-buffer bytes.
+    const UINT indexSize = IndexDataFormat == D3DFMT_INDEX32 ? 4u : 2u;
+    if (drawCount > std::numeric_limits<UINT>::max() / indexSize)
+      return D3DERR_INVALIDCALL;
+    const UINT indexLength = drawCount * indexSize;
+    m_upIndexBuffer.reserve(indexLength);
+    if (!m_upIndexBuffer.getBuffer()) return D3DERR_INVALIDCALL;
+    const UINT indexOffset = m_upIndexBuffer.update(m_context, pIndexData, indexLength);
+    m_context->IASetIndexBuffer(m_upIndexBuffer.getBuffer(),
+      IndexDataFormat == D3DFMT_INDEX32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, indexOffset);
 
     m_context->IASetPrimitiveTopology(topology);
     m_context->DrawIndexed(drawCount, 0, 0);
@@ -238,20 +324,22 @@ namespace dxup {
     return D3D_OK;
   }
   HRESULT D3D9ImmediateRenderer::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) {
+
     if (!preDraw()) {
-      log::warn("Invalid internal render state achieved.");
       postDraw();
-      return D3D_OK; // Lies!
+      return D3DERR_INVALIDCALL; // Unsupported shader/declaration combination.
     }
 
     if (PrimitiveType == D3DPT_TRIANGLEFAN)
-      return this->drawTriangleFan(true, PrimitiveType, startIndex, primCount, BaseVertexIndex);
+      return this->drawTriangleFan(true, startIndex, primCount, BaseVertexIndex);
 
     D3D_PRIMITIVE_TOPOLOGY topology;
     UINT drawCount = convert::primitiveData(PrimitiveType, primCount, topology);
 
     m_context->IASetPrimitiveTopology(topology);
-    m_context->DrawIndexed(drawCount, startIndex, BaseVertexIndex);
+    const UINT instanceCount = getInstanceCount();
+    if (instanceCount) m_context->DrawIndexedInstanced(drawCount, instanceCount, startIndex, BaseVertexIndex, 0);
+    else m_context->DrawIndexed(drawCount, startIndex, BaseVertexIndex);
 
     postDraw();
     return D3D_OK;
@@ -320,20 +408,50 @@ namespace dxup {
     m_context->RSSetViewports(1, &viewport);
   }
 
-  void D3D9ImmediateRenderer::updateVertexShaderAndInputLayout() {
-    if (m_state->vertexDecl == nullptr || m_state->vertexShader == nullptr)
-      return;
+  std::array<UINT, 16> D3D9ImmediateRenderer::getInstanceStepRates() const {
+    std::array<UINT, 16> steps = {};
+    for (size_t i = 0; i < steps.size(); ++i) {
+      const UINT setting = m_state->streamFrequencies[i];
+      if ((setting & D3DSTREAMSOURCE_INSTANCEDATA) == D3DSTREAMSOURCE_INSTANCEDATA)
+        steps[i] = setting & 0x3fffffffu;
+    }
+    return steps;
+  }
 
-    auto& elements = m_state->vertexDecl->GetD3D11Descs();
+  UINT D3D9ImmediateRenderer::getInstanceCount() const {
+    const UINT setting = m_state->streamFrequencies[0];
+    return (setting & D3DSTREAMSOURCE_INDEXEDDATA) ? (setting & 0x3fffffffu) : 0;
+  }
+
+  void D3D9ImmediateRenderer::updateVertexShaderAndInputLayout() {
+    if (m_state->vertexShader == nullptr) {
+      updateFixedFunctionVertexShader();
+      return;
+    }
+    if (m_state->vertexDecl == nullptr)
+      return;
+    const auto& originalElements = m_state->vertexDecl->GetD3D11Descs();
+    if (originalElements.empty()) return;
+    const auto steps = getInstanceStepRates();
+    std::vector<D3D11_INPUT_ELEMENT_DESC> elements(originalElements);
+    for (auto& element : elements) {
+      if (element.InputSlot < steps.size() && steps[element.InputSlot]) {
+        element.InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
+        element.InstanceDataStepRate = steps[element.InputSlot];
+      } else {
+        element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+        element.InstanceDataStepRate = 0;
+      }
+    }
     auto* vertexShdrBytecode = m_state->vertexShader->GetTranslation();
 
-    ID3D11InputLayout* layout = m_state->vertexShader->GetLinkedInput(m_state->vertexDecl.ptr());
+    ID3D11InputLayout* layout = m_state->vertexShader->GetLinkedInput(m_state->vertexDecl.ptr(), steps);
 
     if (layout == nullptr) {
       HRESULT result = m_device->CreateInputLayout(&elements[0], elements.size(), vertexShdrBytecode->getBytecode(), vertexShdrBytecode->getByteSize(), &layout);
 
       if (!FAILED(result)) {
-        m_state->vertexShader->LinkInput(layout, m_state->vertexDecl.ptr());
+        m_state->vertexShader->LinkInput(layout, m_state->vertexDecl.ptr(), steps);
 
         layout->Release();
       }
@@ -349,6 +467,255 @@ namespace dxup {
 
     m_context->VSSetShader(m_state->vertexShader->GetD3D11Shader(), nullptr, 0);
   }
+
+  bool D3D9ImmediateRenderer::fixedFunctionSupported() const {
+    const auto* declaration = m_state->vertexDecl.ptr();
+    const DWORD fvf = declaration ? declaration->GetFVF() : 0;
+    uint64_t missing = 0;
+    if (!declaration || !fvf) missing |= 1ull << 0; // Always fatal.
+    const bool transformed = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
+    const bool lighting = !transformed && m_state->renderState[D3DRS_LIGHTING];
+    // Specular is emulated by the generated vertex/pixel pair.
+    if (m_state->renderState[D3DRS_VERTEXBLEND] != D3DVBF_DISABLE) missing |= 1ull << 2;
+    if (m_state->renderState[D3DRS_INDEXEDVERTEXBLENDENABLE]) missing |= 1ull << 3;
+    if (m_state->renderState[D3DRS_CLIPPLANEENABLE]) missing |= 1ull << 4;
+    if (m_state->textureStageStates[0][D3DTSS_TEXCOORDINDEX] != 0) missing |= 1ull << 5;
+    if (m_state->textureStageStates[0][D3DTSS_TEXTURETRANSFORMFLAGS] != D3DTTFF_DISABLE) missing |= 1ull << 6;
+    if (lighting) {
+      // D3D9 lights vertices without NORMAL using zero diffuse dot product.
+      // Ambient and emissive lighting remain active; it is not an invalid FVF.
+      for (DWORD source : {m_state->renderState[D3DRS_DIFFUSEMATERIALSOURCE],
+                          m_state->renderState[D3DRS_AMBIENTMATERIALSOURCE]}) {
+        if (source != D3DMCS_MATERIAL && source != D3DMCS_COLOR1 && source != D3DMCS_COLOR2)
+          missing |= 1ull << 8;
+      }
+      const DWORD emissive = m_state->renderState[D3DRS_EMISSIVEMATERIALSOURCE];
+      if (emissive != D3DMCS_MATERIAL && emissive != D3DMCS_COLOR1 && emissive != D3DMCS_COLOR2)
+        missing |= 1ull << 9;
+      const DWORD specular = m_state->renderState[D3DRS_SPECULARMATERIALSOURCE];
+      if (specular != D3DMCS_MATERIAL && specular != D3DMCS_COLOR1 && specular != D3DMCS_COLOR2)
+        missing |= 1ull << 1;
+      unsigned activeLights = 0;
+      for (const auto& entry : m_state->lights) {
+        if (!entry.second.enabled) continue;
+        if (!entry.second.parametersCaptured ||
+            (entry.second.parameters.Type != D3DLIGHT_DIRECTIONAL &&
+             entry.second.parameters.Type != D3DLIGHT_POINT &&
+             entry.second.parameters.Type != D3DLIGHT_SPOT) || ++activeLights > 8)
+          missing |= 1ull << 10;
+      }
+    }
+    if (m_state->renderState[D3DRS_FOGENABLE]) {
+      if (m_state->renderState[D3DRS_FOGTABLEMODE] != D3DFOG_NONE ||
+          m_state->renderState[D3DRS_RANGEFOGENABLE]) missing |= 1ull << 11;
+      const DWORD mode = m_state->renderState[D3DRS_FOGVERTEXMODE];
+      if (mode != D3DFOG_NONE && mode != D3DFOG_LINEAR &&
+          mode != D3DFOG_EXP && mode != D3DFOG_EXP2) missing |= 1ull << 12;
+      if (mode != D3DFOG_NONE && transformed && !(fvf & D3DFVF_SPECULAR)) missing |= 1ull << 13;
+      if (mode != D3DFOG_NONE && (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZW)
+        missing |= 1ull << 14;
+    }
+    for (unsigned i = 1; i < 8; ++i)
+      if (m_state->textureStageStates[i][D3DTSS_COLOROP] != D3DTOP_DISABLE)
+        missing |= 1ull << 15;
+    if (m_state->textures[0] && m_state->textures[0]->GetType() != D3DRTYPE_TEXTURE)
+      missing |= 1ull << 16;
+    if (!fixed_function::supportedColorOp(m_state->textureStageStates[0][D3DTSS_COLOROP]) ||
+        !fixed_function::supportedColorOp(m_state->textureStageStates[0][D3DTSS_ALPHAOP]))
+      missing |= 1ull << 17;
+    for (auto arg : {m_state->textureStageStates[0][D3DTSS_COLORARG1],
+                     m_state->textureStageStates[0][D3DTSS_COLORARG2],
+                     m_state->textureStageStates[0][D3DTSS_ALPHAARG1],
+                     m_state->textureStageStates[0][D3DTSS_ALPHAARG2]})
+      if (!fixed_function::supportedArgument(arg)) missing |= 1ull << 18;
+
+    return !missing;
+  }
+
+  bool D3D9ImmediateRenderer::updateFixedFunctionVertexShader() {
+    if (!fixedFunctionSupported()) return false;
+    auto* decl = m_state->vertexDecl.ptr();
+    const uint32_t key = fixed_function::vertexKey(decl->GetFVF());
+    auto found = m_ffVertexShaders.find(key);
+    if (found == m_ffVertexShaders.end()) {
+      std::string source = fixed_function::vertexSource(key);
+      Com<ID3DBlob> shaderBytecode;
+      Com<ID3DBlob> errors;
+      HRESULT result = E_FAIL;
+      if (!d3dcompiler::compile(&result, source.c_str(), "main", "vs_4_0",
+                                 &shaderBytecode, &errors) || FAILED(result)) {
+        if (errors != nullptr)
+          log::warn("Fixed-function VS compile failed: %s", (char*)errors->GetBufferPointer());
+        else
+          log::warn("Fixed-function VS: D3DCompiler unavailable or compile failed.");
+        return false;
+      }
+      FFVertexProgram compiled;
+      result = m_device->CreateVertexShader(shaderBytecode->GetBufferPointer(),
+        shaderBytecode->GetBufferSize(), nullptr, &compiled.shader);
+      if (FAILED(result)) return false;
+      auto* start = static_cast<const uint8_t*>(shaderBytecode->GetBufferPointer());
+      compiled.bytecode.assign(start, start + shaderBytecode->GetBufferSize());
+      found = m_ffVertexShaders.emplace(key, std::move(compiled)).first;
+    }
+
+    const auto steps = getInstanceStepRates();
+    if (decl != m_ffInputDecl.ptr() || key != m_ffInputKey || m_ffInputLayout == nullptr ||
+        steps != m_ffInstanceStepRates) {
+      const auto& originalElements = decl->GetD3D11Descs();
+      if (originalElements.empty()) return false;
+      std::vector<D3D11_INPUT_ELEMENT_DESC> elements(originalElements);
+      for (auto& element : elements) {
+        if (element.InputSlot < steps.size() && steps[element.InputSlot]) {
+          element.InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
+          element.InstanceDataStepRate = steps[element.InputSlot];
+        } else {
+          element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+          element.InstanceDataStepRate = 0;
+        }
+      }
+      Com<ID3D11InputLayout> layout;
+      HRESULT result = m_device->CreateInputLayout(elements.data(),
+        static_cast<UINT>(elements.size()), found->second.bytecode.data(),
+        found->second.bytecode.size(), &layout);
+      if (FAILED(result)) {
+        log::warn("Fixed-function VS: cannot create FVF input layout.");
+        return false;
+      }
+      m_ffInputLayout = layout;
+      m_ffInputDecl = decl;
+      m_ffInputKey = key;
+      m_ffInstanceStepRates = steps;
+    }
+    m_context->IASetInputLayout(m_ffInputLayout.ptr());
+    m_context->VSSetShader(found->second.shader.ptr(), nullptr, 0);
+    m_state->dirtyFlags &= ~(dirtyFlags::vertexDecl | dirtyFlags::vertexShader);
+    return true;
+  }
+
+  bool D3D9ImmediateRenderer::updateFixedFunctionConstants() {
+    if (m_ffVertexBuffer == nullptr || m_ffPixelBuffer == nullptr) return false;
+    FFVertexConstants vs = {};
+    if (m_state->vertexShader == nullptr) {
+      D3DMATRIX world, view, projection, temp;
+      m_state->GetTransform(D3DTS_WORLD, &world);
+      m_state->GetTransform(D3DTS_VIEW, &view);
+      m_state->GetTransform(D3DTS_PROJECTION, &projection);
+      matrix_math::multiply(world.m, view.m, temp.m);
+      matrix_math::inverseTranspose3x3(temp.m, vs.normalWorldView);
+      vs.normalSettings[0] = m_state->renderState[D3DRS_NORMALIZENORMALS] ? 1.0f : 0.0f;
+      matrix_math::multiply(temp.m, projection.m, vs.worldViewProjection);
+      vs.viewport[0] = float(m_state->viewport.X);
+      vs.viewport[1] = float(m_state->viewport.Y);
+      vs.viewport[2] = float(m_state->viewport.Width);
+      vs.viewport[3] = float(m_state->viewport.Height);
+      if (!vs.viewport[2] || !vs.viewport[3]) return false;
+      // Unlit fixed function uses white when no vertex diffuse is supplied.
+      vs.materialDiffuse[0] = vs.materialDiffuse[1] =
+        vs.materialDiffuse[2] = vs.materialDiffuse[3] = 1.0f;
+      std::memcpy(vs.world, world.m, sizeof(vs.world));
+      std::memcpy(vs.view, view.m, sizeof(vs.view));
+      const bool transformed = (m_state->vertexDecl->GetFVF() & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
+      bool lighting = !transformed && m_state->renderState[D3DRS_LIGHTING];
+      vs.specularSettings[0] = m_state->renderState[D3DRS_SPECULARENABLE] ? 1.0f : 0.0f;
+      if (lighting) {
+        const auto& mat = m_state->material;
+        const auto copyColor = [](float* dst, const D3DCOLORVALUE& c) {
+          dst[0] = c.r; dst[1] = c.g; dst[2] = c.b; dst[3] = c.a;
+        };
+        copyColor(vs.materialDiffuse, mat.Diffuse);
+        copyColor(vs.materialAmbient, mat.Ambient);
+        copyColor(vs.materialEmissive, mat.Emissive);
+        copyColor(vs.materialSpecular, mat.Specular);
+        vs.specularSettings[2] = mat.Power;
+        convert::color(m_state->renderState[D3DRS_AMBIENT], vs.globalAmbient);
+        vs.lightingSettings[0] = 1.0f;
+        const DWORD fvf = m_state->vertexDecl->GetFVF();
+        const bool hasDiffuse = (fvf & D3DFVF_DIFFUSE) != 0;
+        const bool hasSpecular = (fvf & D3DFVF_SPECULAR) != 0;
+        const bool colorVertex = m_state->renderState[D3DRS_COLORVERTEX] != 0;
+        const auto materialSource = [&](DWORD source) -> float {
+          if (!colorVertex) return 0.0f;
+          if (source == D3DMCS_COLOR1 && hasDiffuse) return 1.0f;
+          if (source == D3DMCS_COLOR2 && hasSpecular) return 2.0f;
+          // D3D9 uses the material color if a selected vertex color is absent.
+          return 0.0f;
+        };
+        vs.lightingSettings[2] = materialSource(m_state->renderState[D3DRS_DIFFUSEMATERIALSOURCE]);
+        vs.lightingSettings[3] = materialSource(m_state->renderState[D3DRS_AMBIENTMATERIALSOURCE]);
+        vs.emissiveControl[0] = materialSource(m_state->renderState[D3DRS_EMISSIVEMATERIALSOURCE]);
+        vs.specularSettings[1] = materialSource(m_state->renderState[D3DRS_SPECULARMATERIALSOURCE]);
+        vs.specularSettings[3] = m_state->renderState[D3DRS_LOCALVIEWER] ? 1.0f : 0.0f;
+        unsigned count = 0;
+        for (const auto& entry : m_state->lights) {
+          const auto& light = entry.second;
+          if (!light.enabled) continue;
+          if (count == 8) return false;
+          vs.lightDirection[count][0] = light.parameters.Direction.x;
+          vs.lightDirection[count][1] = light.parameters.Direction.y;
+          vs.lightDirection[count][2] = light.parameters.Direction.z;
+          vs.lightDirection[count][3] = static_cast<float>(light.parameters.Type);
+          vs.lightPosition[count][0] = light.parameters.Position.x;
+          vs.lightPosition[count][1] = light.parameters.Position.y;
+          vs.lightPosition[count][2] = light.parameters.Position.z;
+          vs.lightPosition[count][3] = light.parameters.Range;
+          vs.lightAttenuation[count][0] = light.parameters.Attenuation0;
+          vs.lightAttenuation[count][1] = light.parameters.Attenuation1;
+          vs.lightAttenuation[count][2] = light.parameters.Attenuation2;
+          vs.lightAttenuation[count][3] = light.parameters.Falloff;
+          vs.lightSpotAngles[count][0] = std::cos(light.parameters.Theta * 0.5f);
+          vs.lightSpotAngles[count][1] = std::cos(light.parameters.Phi * 0.5f);
+          copyColor(vs.lightDiffuse[count], light.parameters.Diffuse);
+          copyColor(vs.lightAmbient[count], light.parameters.Ambient);
+          copyColor(vs.lightSpecular[count], light.parameters.Specular);
+          ++count;
+        }
+        vs.lightingSettings[1] = static_cast<float>(count);
+      }
+      const DWORD fogMode = m_state->renderState[D3DRS_FOGVERTEXMODE];
+      std::memcpy(&vs.fogSettings[0], &m_state->renderState[D3DRS_FOGSTART], sizeof(float));
+      std::memcpy(&vs.fogSettings[1], &m_state->renderState[D3DRS_FOGEND], sizeof(float));
+      std::memcpy(&vs.fogSettings[2], &m_state->renderState[D3DRS_FOGDENSITY], sizeof(float));
+      vs.fogSettings[3] = static_cast<float>(fogMode);
+      m_context->UpdateSubresource(m_ffVertexBuffer.ptr(), 0, nullptr, &vs, 0, 0);
+      ID3D11Buffer* buffer = m_ffVertexBuffer.ptr();
+      m_context->VSSetConstantBuffers(1, 1, &buffer);
+    }
+    if (m_state->pixelShader == nullptr) {
+      FFPixelConstants ps = {};
+      convert::color(m_state->renderState[D3DRS_TEXTUREFACTOR], ps.textureFactor);
+      const auto& stage = m_state->textureStageStates[0];
+      ps.colorConfig[0] = stage[D3DTSS_COLOROP];
+      ps.colorConfig[1] = stage[D3DTSS_COLORARG1];
+      ps.colorConfig[2] = stage[D3DTSS_COLORARG2];
+      ps.colorConfig[3] = m_state->textures[0] != nullptr;
+      ps.alphaConfig[0] = stage[D3DTSS_ALPHAOP];
+      // With no bound texture, a stage requiring TEXTURE has no input.
+      // Preserve diffuse (including alpha) rather than multiplying by a
+      // synthetic white texel and selecting its alpha.
+      if (!m_state->textures[0]) {
+        if (fixed_function::operationNeedsTexture(ps.colorConfig[0], ps.colorConfig[1], ps.colorConfig[2]))
+          ps.colorConfig[0] = D3DTOP_DISABLE;
+        if (fixed_function::operationNeedsTexture(ps.alphaConfig[0],
+            stage[D3DTSS_ALPHAARG1], stage[D3DTSS_ALPHAARG2]))
+          ps.alphaConfig[0] = D3DTOP_DISABLE;
+      }
+      ps.alphaConfig[1] = stage[D3DTSS_ALPHAARG1];
+      ps.alphaConfig[2] = stage[D3DTSS_ALPHAARG2];
+      ps.alphaConfig[3] = m_state->renderState[D3DRS_ALPHATESTENABLE];
+      ps.testConfig[0] = m_state->renderState[D3DRS_ALPHAFUNC];
+      ps.testConfig[1] = m_state->renderState[D3DRS_ALPHAREF] & 255u;
+      ps.testConfig[2] = m_state->renderState[D3DRS_FOGENABLE] &&
+        m_state->renderState[D3DRS_FOGVERTEXMODE] != D3DFOG_NONE;
+      ps.specularControl[0] = m_state->renderState[D3DRS_SPECULARENABLE] != 0;
+      convert::color(m_state->renderState[D3DRS_FOGCOLOR], ps.fogColor);
+      m_context->UpdateSubresource(m_ffPixelBuffer.ptr(), 0, nullptr, &ps, 0, 0);
+      ID3D11Buffer* buffer = m_ffPixelBuffer.ptr();
+      m_context->PSSetConstantBuffers(1, 1, &buffer);
+    }
+    return true;
+  }
+
   void D3D9ImmediateRenderer::updateDepthStencilState() {
     D3D11_DEPTH_STENCIL_DESC desc;
     desc.BackFace.StencilDepthFailOp = convert::stencilOp(m_state->renderState[D3DRS_CCW_STENCILZFAIL]);
@@ -364,6 +731,11 @@ namespace dxup {
     desc.FrontFace.StencilFailOp = convert::stencilOp(m_state->renderState[D3DRS_STENCILFAIL]);
     desc.FrontFace.StencilPassOp = convert::stencilOp(m_state->renderState[D3DRS_STENCILPASS]);
     desc.FrontFace.StencilFunc = convert::func(m_state->renderState[D3DRS_STENCILFUNC]);
+
+    // D3D9 uses the clockwise stencil setup for both faces unless
+    // D3DRS_TWOSIDEDSTENCILMODE explicitly enables the CCW states.
+    if (!m_state->renderState[D3DRS_TWOSIDEDSTENCILMODE])
+      desc.BackFace = desc.FrontFace;
 
     desc.StencilEnable = m_state->renderState[D3DRS_STENCILENABLE] == TRUE ? TRUE : FALSE;
     desc.StencilReadMask = (UINT8)(m_state->renderState[D3DRS_STENCILMASK] & 0x000000FF); // I think we can do this.
@@ -391,7 +763,7 @@ namespace dxup {
   }
   void D3D9ImmediateRenderer::updateRasterizer() {
     D3D11_RASTERIZER_DESC1 desc;
-    desc.AntialiasedLineEnable = false;
+    desc.AntialiasedLineEnable = m_state->renderState[D3DRS_ANTIALIASEDLINEENABLE] == TRUE;
     desc.CullMode = convert::cullMode(m_state->renderState[D3DRS_CULLMODE]);
     desc.DepthBias = (INT)reinterpret::dwordToFloat(m_state->renderState[D3DRS_DEPTHBIAS]);
     desc.DepthBiasClamp = D3D11_DEFAULT_DEPTH_BIAS_CLAMP;
@@ -424,7 +796,7 @@ namespace dxup {
     m_state->dirtyFlags &= ~dirtyFlags::rasterizer;
   }
   void D3D9ImmediateRenderer::updateBlendState() {
-    D3D11_BLEND_DESC1 desc;
+    D3D11_BLEND_DESC1 desc = {};
     desc.AlphaToCoverageEnable = false;
     desc.IndependentBlendEnable = false;
 
@@ -490,8 +862,12 @@ namespace dxup {
     desc.Filter = convert::filter(samplerState[D3DSAMP_MAGFILTER], samplerState[D3DSAMP_MINFILTER], samplerState[D3DSAMP_MIPFILTER]);
     desc.MaxAnisotropy = std::clamp((UINT)samplerState[D3DSAMP_MAXANISOTROPY], 0u, 16u);
     desc.MipLODBias = std::clamp(reinterpret::dwordToFloat(samplerState[D3DSAMP_MIPMAPLODBIAS]), -16.0f, 15.99f);
-    desc.MaxLOD = (FLOAT)samplerState[D3DSAMP_MAXMIPLEVEL];
-    desc.MinLOD = -FLT_MAX;
+    DWORD textureLOD = 0;
+    IDirect3DBaseTexture9* texture = m_state->textures[sampler];
+    if (texture != nullptr)
+      textureLOD = texture->GetLOD();
+    desc.MinLOD = mipmap::minSamplerLOD(samplerState[D3DSAMP_MAXMIPLEVEL], textureLOD);
+    desc.MaxLOD = FLT_MAX;
 
     size_t hash = m_caches.sampler.hash(desc);
     ID3D11SamplerState* state = m_caches.sampler.lookupObject(hash);
@@ -511,12 +887,11 @@ namespace dxup {
 
     if (sampler < 16)
       m_context->PSSetSamplers(sampler, 1, &state);
-    else {
-      sampler -= 16;
-      m_context->VSSetSamplers(sampler, 1, &state);
-    }
+    else
+      m_context->VSSetSamplers(sampler - 16, 1, &state);
 
-    m_state->dirtySamplers &= ~(1ull << sampler);
+    // Clear the original bit index, including vertex samplers 16-19.
+    m_state->dirtySamplers &= ~(1u << sampler);
   }
   void D3D9ImmediateRenderer::updateSamplers() {
     for (uint32_t i = 0; i < 20; i++) {
@@ -548,6 +923,12 @@ namespace dxup {
           break;
         }
 
+        case D3DRTYPE_VOLUMETEXTURE: {
+          Direct3DVolumeTexture9* tex = reinterpret_cast<Direct3DVolumeTexture9*>(pTexture);
+          srvs[i] = tex->GetDXUPResource()->GetSRV(srgb);
+          break;
+        }
+
         default: log::warn("updateTextures: unknown resource type as a texture."); break;
 
         }
@@ -556,6 +937,7 @@ namespace dxup {
 
     m_context->PSSetShaderResources(0, 16, &srvs[0]);
     m_context->VSSetShaderResources(0, 4, &srvs[16]);
+    m_state->dirtyFlags &= ~dirtyFlags::textures;
   }
   void D3D9ImmediateRenderer::updateRenderTargets() {
     std::array<ID3D11RenderTargetView*, 4> rtvs = { nullptr, nullptr, nullptr, nullptr };
@@ -581,11 +963,29 @@ namespace dxup {
     m_state->dirtyFlags &= ~dirtyFlags::renderTargets;
   }
   void D3D9ImmediateRenderer::updatePixelShader() {
-    if (m_state->pixelShader != nullptr)
+    if (m_state->pixelShader != nullptr) {
       m_context->PSSetShader(m_state->pixelShader->GetD3D11Shader(), nullptr, 0);
-    else
-      m_context->PSSetShader(nullptr, nullptr, 0);
-
+    } else {
+      if (m_ffPixelShader == nullptr) {
+        Com<ID3DBlob> bytecode, errors;
+        HRESULT result = E_FAIL;
+        if (!d3dcompiler::compile(&result, fixed_function::pixelSource(), "main", "ps_4_0",
+                                   &bytecode, &errors) || FAILED(result)) {
+          if (errors != nullptr)
+            log::warn("Fixed-function PS compile failed: %s", (char*)errors->GetBufferPointer());
+          else
+            log::warn("Fixed-function PS: D3DCompiler unavailable or compile failed.");
+          return;
+        }
+        result = m_device->CreatePixelShader(bytecode->GetBufferPointer(),
+          bytecode->GetBufferSize(), nullptr, &m_ffPixelShader);
+        if (FAILED(result)) {
+          log::fail("Fixed-function PS: CreatePixelShader failed hr=0x%08lx", (unsigned long)result);
+          return;
+        }
+          }
+      m_context->PSSetShader(m_ffPixelShader.ptr(), nullptr, 0);
+    }
     m_state->dirtyFlags &= ~dirtyFlags::pixelShader;
   }
   void D3D9ImmediateRenderer::updateVertexBuffer() {
@@ -675,18 +1075,34 @@ namespace dxup {
     if (m_state->depthStencil != nullptr && m_state->depthStencil->GetD3D9Desc().Discard) {
       ID3D11DepthStencilView* dsv = m_state->depthStencil->GetD3D11DepthStencil();
       if (dsv)
-        m_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 0.0f, 0);
+        // Discarded depth is undefined in D3D9. Clearing to near (0.0)
+        // makes ordinary LESS/LESSEQUAL world geometry fail its depth test.
+        // Start the recycled surface at far depth instead.
+        m_context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
     }
   }
 
   //
 
   bool D3D9ImmediateRenderer::canDraw() {
-    return !( (m_state->dirtyFlags & dirtyFlags::vertexDecl) || (m_state->dirtyFlags & dirtyFlags::vertexShader) );
+    const uint32_t pending = dirtyFlags::vertexDecl | dirtyFlags::vertexShader | dirtyFlags::pixelShader;
+    if (m_state->dirtyFlags & pending) return false;
+    if (m_state->vertexShader == nullptr && !fixedFunctionSupported()) return false;
+    return true;
   }
   bool D3D9ImmediateRenderer::preDraw() {
+    // D3D9 defaults to fixed-function pixel shading when SetPixelShader was
+    // never called. The initial state has no PS dirty bit, which previously
+    // left the D3D11 pixel stage unbound for games like Obscure. Ensure the
+    // fixed-function shader is created on the first such draw. Explicit D3D9
+    // pixel shaders and subsequent state transitions follow the normal path.
+    if (m_state->pixelShader == nullptr && m_ffPixelShader.ptr() == nullptr)
+      m_state->dirtyFlags |= dirtyFlags::pixelShader;
     undirtyContext();
-    return canDraw();
+    bool can = canDraw();
+    if (can && (m_state->vertexShader == nullptr || m_state->pixelShader == nullptr))
+      can = updateFixedFunctionConstants();
+    return can;
   }
   void D3D9ImmediateRenderer::postDraw() {
     // Nothing here yet!

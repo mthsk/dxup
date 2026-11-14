@@ -42,13 +42,17 @@ namespace dxup {
 
   template <typename T>
   void pushAlignedString(std::vector<T>& vec, const char* str, size_t len) {
-    len++; // for NULL terminator
-    size_t paddedLen = alignTo(len, sizeof(T));
+    const size_t paddedLen = alignTo(len + 1, sizeof(T));
 
-    uint32_t* end = nextPtr(vec);
-    vec.resize(vec.size() + (paddedLen / sizeof(T)));
-    std::memset(end, 0xAB, paddedLen); // FXC pads with 0xAB
-    std::memcpy(end, str, len);
+    // Resizing may reallocate the vector: do not retain a pointer acquired
+    // before resize. Write the string and terminator into the new storage.
+    const size_t firstElement = vec.size();
+    vec.resize(firstElement + paddedLen / sizeof(T));
+    unsigned char* dest = reinterpret_cast<unsigned char*>(vec.data() + firstElement);
+    std::memset(dest, 0xAB, paddedLen); // FXC padding
+    if (len != 0)
+      std::memcpy(dest, str, len);
+    dest[len] = 0;
   }
 
   template <typename T>

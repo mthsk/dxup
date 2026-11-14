@@ -167,25 +167,63 @@ namespace dxup {
 
     m_resource = resource;
 
-    if (GetSubresource() == 0 && m_d3d9Desc.Usage & D3DUSAGE_DEPTHSTENCIL) {
-      if (FAILED(GetD3D11Device()->CreateDepthStencilView(resource->GetResource(), nullptr, &m_dsView)))
+    if (GetSubresource() == 0 &&
+        ((m_d3d9Desc.Usage & D3DUSAGE_DEPTHSTENCIL) || m_d3d9Desc.Format == D3DFMT_INTZ)) {
+      if (m_d3d9Desc.Format == D3DFMT_INTZ) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsvDesc{};
+        dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dsvDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        dsvDesc.Texture2D.MipSlice = m_mip;
+        HRESULT hr = GetD3D11Device()->CreateDepthStencilView(resource->GetResource(), &dsvDesc, &m_dsView);
+        if (FAILED(hr))
+          log::warn("Failed to create INTZ depth stencil view: 0x%08x", (unsigned)hr);
+      } else if (FAILED(GetD3D11Device()->CreateDepthStencilView(resource->GetResource(), nullptr, &m_dsView))) {
         log::warn("Failed to create depth stencil for surface!");
+      }
     }
 
-    if (GetSubresource() == 0 && m_d3d9Desc.Usage & D3DUSAGE_RENDERTARGET) {
-      D3D11_RENDER_TARGET_VIEW_DESC desc;
-      desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
-      desc.Texture2D.MipSlice = 0;
+    // Render targets can be texture mip levels and cube/array slices. The old
+    // subresource-zero test silently skipped all other surfaces, leaving RTVs
+    // null when games render into mip > 0 or faces other than the first.
+    if (m_d3d9Desc.Usage & D3DUSAGE_RENDERTARGET) {
+      D3D11_TEXTURE2D_DESC textureDesc = {};
+      resource->GetResourceAs<ID3D11Texture2D>()->GetDesc(&textureDesc);
+      D3D11_RENDER_TARGET_VIEW_DESC desc = {};
+      if (textureDesc.SampleDesc.Count > 1) {
+        if (textureDesc.ArraySize > 1) {
+          desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+          desc.Texture2DMSArray.FirstArraySlice = m_slice;
+          desc.Texture2DMSArray.ArraySize = 1;
+        } else {
+          desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
+        }
+      } else if (textureDesc.ArraySize > 1) {
+        desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+        desc.Texture2DArray.MipSlice = m_mip;
+        desc.Texture2DArray.FirstArraySlice = m_slice;
+        desc.Texture2DArray.ArraySize = 1;
+      } else {
+        desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        desc.Texture2D.MipSlice = m_mip;
+      }
 
-      desc.Format = convert::makeTypeless(resource->GetDXGIFormat());
-      desc.Format = convert::makeUntypeless(desc.Format, false);
-      if (FAILED(GetD3D11Device()->CreateRenderTargetView(resource->GetResource(), &desc, &m_rtView)))
-        log::warn("Failed to create non-SRGB render target for surface!");
+      desc.Format = convert::makeUntypeless(convert::makeTypeless(resource->GetDXGIFormat()), false);
+      HRESULT hr = GetD3D11Device()->CreateRenderTargetView(resource->GetResource(), &desc, &m_rtView);
+      if (FAILED(hr)) {
+        log::warn("RTV creation failed: D3D9 format=%u DXGI=%u mip=%u slice=%u usage=0x%08x hr=0x%08x",
+          (unsigned)m_d3d9Desc.Format, (unsigned)resource->GetDXGIFormat(), m_mip, m_slice,
+          (unsigned)m_d3d9Desc.Usage, (unsigned)hr);
+      }
 
-      desc.Format = convert::makeTypeless(resource->GetDXGIFormat());
-      desc.Format = convert::makeUntypeless(desc.Format, true);
-      if (FAILED(GetD3D11Device()->CreateRenderTargetView(resource->GetResource(), &desc, &m_rtViewSRGB)))
-        log::warn("Failed to create SRGB render target for surface!");
+      const DXGI_FORMAT linearFormat = desc.Format;
+      desc.Format = convert::makeUntypeless(convert::makeTypeless(resource->GetDXGIFormat()), true);
+      if (desc.Format == linearFormat) {
+        m_rtViewSRGB = m_rtView;
+      } else if (FAILED(GetD3D11Device()->CreateRenderTargetView(resource->GetResource(), &desc, &m_rtViewSRGB))) {
+        // Some formats have no sRGB rendering variant. Preserve the linear RTV
+        // instead of leaving an otherwise valid D3D9 surface unrenderable.
+        m_rtViewSRGB = m_rtView;
+      }
     }
 
     if (config::getBool(config::GDICompatible))

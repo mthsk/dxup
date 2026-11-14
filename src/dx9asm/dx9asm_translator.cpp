@@ -37,13 +37,22 @@ namespace dxup {
         token = nextToken();
       }
 
+      if (!m_loopCounters.empty()) {
+        log::fail("Unclosed loop block in shader");
+        return false;
+      }
+
+      if (!m_repCounters.empty()) {
+        log::fail("Unclosed rep block in shader");
+        return false;
+      }
+
       // r0 in SM1 is the colour output register. Move r0 -> target here.
       if (getShaderType() == ShaderType::Pixel && getMajorVersion() == 1) {
         RegisterMapping* r0 = getRegisterMap().getRegisterMapping(D3DSPR_TEMP, 0);
-        DXBCOperand r0Op = r0->dxbcOperand;
-        r0Op.setSwizzleOrWritemask(noSwizzle);
-
         if (r0 != nullptr) {
+          DXBCOperand r0Op = r0->dxbcOperand;
+          r0Op.setSwizzleOrWritemask(noSwizzle);
           RegisterMapping* target = getRegisterMap().lookupOrCreateRegisterMapping(
             *this,
             D3DSPR_COLOROUT,

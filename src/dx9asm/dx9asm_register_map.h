@@ -26,7 +26,7 @@ namespace dxup {
       }
 
       inline const RegisterMapping* getRegisterMapping(const DX9Operand& operand) const {
-        return getRegisterMapping(operand);
+        return getRegisterMapping(operand.getRegType(), operand.getRegNumber());
       }
 
       inline RegisterMapping* getRegisterMapping(const DX9Operand& operand) {
@@ -34,7 +34,11 @@ namespace dxup {
       }
 
       inline const RegisterMapping* getRegisterMapping(uint32_t type, uint32_t index) const {
-        return getRegisterMapping(type, index);
+        for (const RegisterMapping& mapping : m_registerMap) {
+          if (mapping.dx9Type == type && mapping.dx9Id == index)
+            return &mapping;
+        }
+        return nullptr;
       }
 
       inline RegisterMapping* getRegisterMapping(uint32_t type, uint32_t index) {
@@ -54,10 +58,9 @@ namespace dxup {
           const DXBCOperand& lumOperand = lum.dxbcOperand;
 
           if (lumOperand.getRegisterType() == type) {
-            highestIdForType = std::max(highestIdForType, lumOperand.getRegNumber());
-
-            if (highestIdForType == invalidId)
-              highestIdForType = lumOperand.getRegNumber();
+            highestIdForType = highestIdForType == invalidId
+              ? lumOperand.getRegNumber()
+              : std::max(highestIdForType, lumOperand.getRegNumber());
           }
         }
 
@@ -88,8 +91,11 @@ namespace dxup {
           if (!transient) {
             uint32_t highestIdForType = getHighestIdForDXBCType(dxbcOperand.getRegisterType());
 
-            highestIdForType++;
-            regNumber = highestIdForType;
+            uint32_t next = highestIdForType == UINT32_MAX ? 0 : highestIdForType + 1;
+            if (dxbcOperand.getRegisterType() == D3D10_SB_OPERAND_TYPE_TEMP &&
+                m_highestInternalTemp != UINT32_MAX)
+              next = std::max(next, m_highestInternalTemp + 1);
+            regNumber = next;
           }
           else
             regNumber = getTransientId(mapping.dclInfo);
@@ -113,7 +119,10 @@ namespace dxup {
       }
 
       inline DXBCOperand getNextInternalTemp() {
-        m_highestInternalTemp = getDXBCTypeCount(D3D10_SB_OPERAND_TYPE_TEMP);
+        uint32_t next = getDXBCTypeCount(D3D10_SB_OPERAND_TYPE_TEMP);
+        if (m_highestInternalTemp != UINT32_MAX)
+          next = std::max(next, m_highestInternalTemp + 1);
+        m_highestInternalTemp = next;
 
         DXBCOperand op{ D3D10_SB_OPERAND_TYPE_TEMP, 1 };
         op.stripModifier();

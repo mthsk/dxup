@@ -1,4 +1,4 @@
-﻿#include "dxbc_chunks.h"
+#include "dxbc_chunks.h"
 #include "dxbc_shaderflags.h"
 #include "../util/placeholder_ptr.h"
 #include "dx9asm_modifiers.h"
@@ -332,6 +332,17 @@ namespace dxup {
       void writeIODcls(ShaderBytecode& bytecode, ShaderCodeTranslator& shdrCode) {
         auto& obj = bytecode.getBytecodeVector();
         forEachValidElement<Input>(bytecode, shdrCode, [&](const RegisterMapping& mapping, uint32_t i) {
+          if (!Input && mapping.dxbcOperand.getRegisterType() == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH) {
+            // Depth uses an unindexed, scalar special operand. It has no
+            // extra system-value token in the instruction stream; its
+            // SV_Depth meaning is carried by the OSGN signature.
+            DXBCOperand depth = mapping.dxbcOperand;
+            depth.setComponents(1).setDimension(D3D10_SB_OPERAND_INDEX_0D)
+              .setSwizzleOrWritemask(noSwizzle);
+            DXBCOperation{ D3D10_SB_OPCODE_DCL_OUTPUT, false }
+              .appendOperand(depth).push(obj);
+            return;
+          }
           uint32_t siv = convert::sysValue(Input && shdrCode.getShaderType() == ShaderType::Vertex, mapping.dclInfo.target, mapping.dclInfo.usage);
           const bool hasSiv = siv != D3D_NAME_UNDEFINED;
 
@@ -520,6 +531,10 @@ namespace dxup {
             element.nameOffset = 0; // <-- Must be set later!
             element.registerIndex = transMapping.dxbcRegNum;
             element.semanticIndex = transMapping.dxbcSemanticIndex;
+            // The D3D11 signature requires an actual system-value tag for
+            // SV_Position, including the ps_3_0 vPos rasterizer input.
+            if (transMapping.d3d9Usage == D3DDECLUSAGE_POSITION)
+              element.systemValueType = D3D_NAME_POSITION;
 
             uint32_t baseMask = 0;
             forEachValidElement<isInput(ChunkType)>(bytecode, shdrCode, [&](const RegisterMapping& mapping, uint32_t i) {
@@ -554,7 +569,11 @@ namespace dxup {
             IOSGNElement element;
 
             element.nameOffset = 0; // <-- Must be set later!
-            element.registerIndex = mapping.dxbcOperand.getRegNumber();
+            const bool depthOutput = !isInput(ChunkType) &&
+              mapping.dxbcOperand.getRegisterType() == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH;
+            // In the OSGN signature SV_Depth has register index 0xffffffff,
+            // unlike ordinary o# color outputs.
+            element.registerIndex = depthOutput ? UINT32_MAX : mapping.dxbcOperand.getRegNumber();
             element.semanticIndex = mapping.dclInfo.usageIndex;
 
             uint32_t baseMask = isInput(ChunkType) ? mapping.readMask : mapping.writeMask;
@@ -568,7 +587,12 @@ namespace dxup {
             rwMask = rwMask << 8;
             element.mask |= rwMask;
 
-            element.systemValueType = convert::sysValue(ChunkType == chunks::ISGN, mapping.dclInfo.target, mapping.dclInfo.usage);
+            if (depthOutput) {
+              element.mask = 0x000e01u; // scalar X, other channels N/A
+              element.systemValueType = D3D_NAME_DEPTH;
+            } else {
+              element.systemValueType = convert::sysValue(ChunkType == chunks::ISGN, mapping.dclInfo.target, mapping.dclInfo.usage);
+            }
             pushObject(obj, element);
           });
 

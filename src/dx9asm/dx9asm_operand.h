@@ -97,6 +97,14 @@ namespace dxup {
           return 0;
       }
 
+      inline uint32_t getRelativeAddrType(uint32_t majorVersion) const {
+        if (!relativeAddressingUsesToken(majorVersion))
+          return D3DSPR_ADDR;
+        const uint32_t token = m_dx9tokens[m_info->sizeInTokens];
+        return ((token & D3DSP_REGTYPE_MASK2) >> D3DSP_REGTYPE_SHIFT2) |
+               ((token & D3DSP_REGTYPE_MASK) >> D3DSP_REGTYPE_SHIFT);
+      }
+
       inline uint32_t getRelativeAddrSwizzle(uint32_t majorVersion) const {
         if (relativeAddressingUsesToken(majorVersion))
           return m_dx9tokens[m_info->sizeInTokens] & D3DVS_SWIZZLE_MASK;

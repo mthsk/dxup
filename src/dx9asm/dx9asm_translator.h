@@ -29,6 +29,8 @@ namespace dxup {
       inline void reset(const uint32_t* code) {
         m_dxbcCode.clear();
         m_samplers.clear();
+        m_repCounters.clear();
+        m_loopCounters.clear();
         m_map.reset();
         m_indirectConstantUsed = false;
 
@@ -108,6 +110,9 @@ namespace dxup {
       bool handleComment(DX9Operation& operation);
       bool handleDcl(DX9Operation& operation);
       bool handleTex(DX9Operation& operation);
+      bool handleTexkill(DX9Operation& operation);
+      bool handleTexldl(DX9Operation& operation);
+      bool handleTexldd(DX9Operation& operation);
       bool handleGenericTexReg2XX(DX9Operation& operation, uint32_t swizzle);
       bool handleTexReg2Ar(DX9Operation& operation);
       bool handleTexReg2Gb(DX9Operation& operation);
@@ -128,6 +133,10 @@ namespace dxup {
 
       bool handleIf(DX9Operation& operation);
       bool handleIfc(DX9Operation& operation);
+      bool handleRep(DX9Operation& operation);
+      bool handleEndRep(DX9Operation& operation);
+      bool handleLoop(DX9Operation& operation);
+      bool handleEndLoop(DX9Operation& operation);
 
       bool handleScomp(bool lt, DX9Operation& operation);
 
@@ -151,6 +160,9 @@ namespace dxup {
 
       RegisterMap m_map;
 
+      std::vector<DXBCOperand> m_repCounters;
+      struct LoopFrame { DXBCOperand counter; DXBCOperand step; DXBCOperand savedAL; bool hasSavedAL; };
+      std::vector<LoopFrame> m_loopCounters;
       std::vector<SamplerDesc> m_samplers;
       std::vector<uint32_t> m_dxbcCode;
     };

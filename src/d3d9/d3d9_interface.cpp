@@ -99,6 +99,12 @@ namespace dxup {
     if (Adapter >= GetAdapterCount())
       return log::d3derr(D3DERR_INVALIDCALL, "CheckDeviceType: invalid adapter requested (%d).", Adapter);
 
+    // DXUP implements hardware D3D11 devices only.  Never claim an arbitrary
+    // D3DDEVTYPE (including a corrupted pointer treated as an enum) is valid:
+    // some legacy games enumerate and name each successful device type.
+    if (DevType != D3DDEVTYPE_HAL)
+      return D3DERR_NOTAVAILABLE;
+
     switch (AdapterFormat) {
     case D3DFMT_UNKNOWN:
       if (bWindowed == FALSE)
@@ -717,7 +723,7 @@ namespace dxup {
     pCaps->Reserved5 = 0;
     pCaps->MasterAdapterOrdinal = 0;
     pCaps->AdapterOrdinalInGroup = 0;
-    pCaps->NumberOfAdaptersInGroup = 2;
+    pCaps->NumberOfAdaptersInGroup = 1; // DXUP exposes a single adapter per group.
     pCaps->DeclTypes = 1023;
     pCaps->NumSimultaneousRTs = 4;
     pCaps->StretchRectFilterCaps = 50332416;

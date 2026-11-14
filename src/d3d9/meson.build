@@ -23,7 +23,6 @@ d3d9_dll = shared_library('d3d9'+dll_ext, d3d9_main_src,
   name_prefix         : '',
   dependencies        : [ d3d9_deps ],
   install             : true,
-  objects             : not dxup_msvc ? 'd3d9'+def_spec_ext : [],
   vs_module_defs      : 'd3d9'+def_spec_ext,
   override_options    : ['cpp_std='+dxup_cpp_std]
 )

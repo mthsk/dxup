@@ -1,4 +1,5 @@
 #include "d3dcompiler_helpers.h"
+#include <cstring>
 
 namespace dxup {
 
@@ -15,6 +16,20 @@ namespace dxup {
 
       if (d3dcompilerModule == nullptr)
           d3dcompilerModule = LoadLibraryA("d3dcompiler_43.dll");
+    }
+
+    bool compile(HRESULT* result, const char* source, const char* entry,
+                 const char* profile, ID3DBlob** bytecode, ID3DBlob** errors) {
+      loadModule();
+      if (!d3dcompilerModule) return false;
+      using CompileProc = HRESULT (WINAPI*)(LPCVOID, SIZE_T, LPCSTR,
+        const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR, LPCSTR, UINT, UINT,
+        ID3DBlob**, ID3DBlob**);
+      auto proc = reinterpret_cast<CompileProc>(GetProcAddress(d3dcompilerModule, "D3DCompile"));
+      if (!proc) return false;
+      *result = proc(source, std::strlen(source), "dxup fixed function",
+                     nullptr, nullptr, entry, profile, 0, 0, bytecode, errors);
+      return true;
     }
 
     bool disassemble(HRESULT* result, LPCVOID pSrcData, SIZE_T SrcDataSize, UINT Flags, LPCSTR szComments, ID3DBlob** ppDisassembly) {

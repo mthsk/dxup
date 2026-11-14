@@ -19,16 +19,19 @@ namespace dxup {
       if (pNumElements == nullptr)
         return D3DERR_INVALIDCALL;
 
+      const UINT required = static_cast<UINT>(m_d3d9Descs.size()) + 1; // D3DDECL_END
       if (pElement == nullptr) {
-        *pNumElements = m_d3d9Descs.size();
+        *pNumElements = required;
         return D3D_OK;
       }
-
-      UINT size = *pNumElements;
-      if (size > m_d3d9Descs.size())
-        size = m_d3d9Descs.size();
-
-      std::memcpy(pElement, &m_d3d9Descs[0], (size_t)size);
+      if (*pNumElements < required) {
+        *pNumElements = required;
+        return D3DERR_INVALIDCALL;
+      }
+      if (!m_d3d9Descs.empty())
+        std::memcpy(pElement, m_d3d9Descs.data(), sizeof(D3DVERTEXELEMENT9) * m_d3d9Descs.size());
+      pElement[m_d3d9Descs.size()] = D3DDECL_END();
+      *pNumElements = required;
       return D3D_OK;
     }
 
@@ -44,11 +47,16 @@ namespace dxup {
       return E_NOINTERFACE;
     }
 
+    void SetFVF(DWORD fvf) { m_fvf = fvf; }
+    DWORD GetFVF() const { return m_fvf; }
+    const std::vector<D3DVERTEXELEMENT9>& GetD3D9Descs() const { return m_d3d9Descs; }
+
     const std::vector<D3D11_INPUT_ELEMENT_DESC>& GetD3D11Descs() const {
       return m_d3d11Descs;
     }
 
   private:
+    DWORD m_fvf = 0;
     std::vector<D3D11_INPUT_ELEMENT_DESC> m_d3d11Descs;
     std::vector<D3DVERTEXELEMENT9> m_d3d9Descs;
 

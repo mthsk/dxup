@@ -39,6 +39,11 @@ namespace dxup {
 
       {11, 0, D3DDECLUSAGE_FOG, "TEXCOORD", 10},
       {12, 0, D3DDECLUSAGE_PSIZE, "TEXCOORD", 11},
+
+      // GTA IV uses TEXCOORD8. Keep the legacy register assignments stable
+      // and give these additional semantics named, deterministic entries.
+      {13, 8, D3DDECLUSAGE_TEXCOORD, "TEXCOORD", 12},
+      {14, 9, D3DDECLUSAGE_TEXCOORD, "TEXCOORD", 13},
     };
 
     std::vector<TransientRegisterMapping>& RegisterMap::getTransientMappings() {
@@ -55,10 +60,15 @@ namespace dxup {
 
       log::warn("Unable to find transient register! Creating a new transient mapping:\nUsage: %lu\nUsage Index: %lu", info.usage, info.usageIndex);
 
-      TransientRegisterMapping mapping;
+      // A missing semantic name previously produced a null pointer during
+      // DXBC signature serialization (via pushAlignedString). Unknown
+      // semantics must still produce valid, uniquely numbered signatures.
+      TransientRegisterMapping mapping{};
       mapping.d3d9Usage = info.usage;
       mapping.d3d9UsageIndex = info.usageIndex;
-      mapping.dxbcRegNum = transientMappings.size();
+      mapping.dxbcRegNum = static_cast<uint32_t>(transientMappings.size());
+      mapping.dxbcSemanticName = "TEXCOORD";
+      mapping.dxbcSemanticIndex = mapping.dxbcRegNum - 1;
 
       transientMappings.push_back(mapping);
 
@@ -189,18 +199,58 @@ namespace dxup {
         break;
       }
 
-      case D3DSPR_DEPTHOUT:
+      case D3DSPR_MISCTYPE: {
+        // ps_3_0 vPos is an actual pixel input. Treating it as a literal
+        // corrupts the DXBC input declaration and shader signature.
+        if (translator.getShaderType() == ShaderType::Pixel && regNum == D3DSMO_POSITION) {
+          newMapping.dclInfo.type = UsageType::Input;
+          newMapping.dclInfo.usage = D3DDECLUSAGE_POSITION;
+          newMapping.dclInfo.usageIndex = 0;
+          dxbcType = D3D10_SB_OPERAND_TYPE_INPUT;
+        } else {
+          log::fail("Unsupported misc shader register %u.", regNum);
+          return nullptr;
+        }
+        break;
+      }
+
+      case D3DSPR_DEPTHOUT: {
+        // ps_3_0 oDepth is a scalar, *non-indexed* pixel-depth output.
+        // Using an ordinary OUTPUT register here produces an invalid DXBC
+        // signature (and can silently route depth to a color target).
+        if (translator.getShaderType() != ShaderType::Pixel || regNum != 0) {
+          log::fail("Invalid oDepth register: index=%u shader=%s", regNum,
+            translator.getShaderType() == ShaderType::Pixel ? "ps" : "vs");
+          return nullptr;
+        }
+        newMapping.dclInfo.type = UsageType::Output;
+        newMapping.dclInfo.usage = D3DDECLUSAGE_DEPTH;
+        newMapping.dclInfo.usageIndex = 0;
+        dxbcType = D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH;
+        newMapping.dxbcOperand.setComponents(1);
+        newMapping.dxbcOperand.setDimension(D3D10_SB_OPERAND_INDEX_0D);
+        newMapping.dxbcOperand.setData(nullptr, 0);
+        newMapping.dxbcOperand.setSwizzleOrWritemask(noSwizzle);
+      } break;
+
+      case D3DSPR_LOOP: {
+        // aL is the integer loop-address register used by c#[aL] reads.
+        // Use a stable temporary mapping; handleLoop saves it across nesting.
+        dxbcType = D3D10_SB_OPERAND_TYPE_TEMP;
+      } break;
+
       case D3DSPR_SAMPLER:
       case D3DSPR_CONST2:
       case D3DSPR_CONST3:
       case D3DSPR_CONST4:
-      case D3DSPR_LOOP:
       case D3DSPR_TEMPFLOAT16:
-      case D3DSPR_MISCTYPE:
       case D3DSPR_LABEL:
       case D3DSPR_PREDICATE:
       default:
-        log::fail("Invalid Register Type"); break;
+        log::fail("Invalid Register Type: type=%u index=%u shader=%s version=%u.%u",
+          regType, regNum, translator.getShaderType() == ShaderType::Pixel ? "ps" : "vs",
+          translator.getMajorVersion(), translator.getMinorVersion());
+        break;
       }
 
       newMapping.dxbcOperand.setRegisterType(dxbcType);
@@ -209,7 +259,8 @@ namespace dxup {
       bool transient = io && translator.isTransient(newMapping.dclInfo.type == UsageType::Input);
       bool generateId = translator.shouldGenerateId(transient);
 
-      if (dxbcType == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER)
+      if (dxbcType == D3D10_SB_OPERAND_TYPE_CONSTANT_BUFFER ||
+          dxbcType == D3D10_SB_OPERAND_TYPE_OUTPUT_DEPTH)
         generateId = false;
 
       addRegisterMapping(transient, generateId, newMapping);

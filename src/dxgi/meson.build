@@ -10,7 +10,6 @@ dxgi_dll = shared_library('dxgi'+dll_ext, dxgi_src,
   dependencies        : [ d3d10_1_dep ],
   install             : false,
   vs_module_defs      : 'dxgi'+def_spec_ext,
-  objects             : not dxup_msvc ? 'dxgi'+def_spec_ext : [],
   cpp_args	      : '-DDXUP_DXGI_EXPORTS',
   override_options    : ['cpp_std='+dxup_cpp_std])
 

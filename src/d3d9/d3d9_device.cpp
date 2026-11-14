@@ -16,8 +16,11 @@
 #include "d3d9_query.h"
 #include "d3d9_state.h"
 #include "d3d9_renderer.h"
+#include "d3d9_fvf.h"
 #include <d3d11_4.h>
 #include <float.h>
+#include <algorithm>
+#include <limits>
 
 namespace dxup {
 
@@ -44,6 +47,7 @@ namespace dxup {
     , m_state{ new D3D9State(this, 0) }
     , m_stateBlock{ nullptr } {
     m_renderer = new D3D9ImmediateRenderer{ device, context, m_state };
+
     InitializeCriticalSection(&m_criticalSection);
 
     if (!(behaviourFlags & D3DCREATE_FPU_PRESERVE))
@@ -131,6 +135,7 @@ namespace dxup {
     if (FAILED(result))
       return result;
 
+
     SetupD3D11Debug(device.ptr());
 
     if (behaviourFlags & D3DCREATE_MULTITHREADED) {
@@ -151,14 +156,28 @@ namespace dxup {
     if (isEx)
       flags |= DeviceFlag_Ex;
 
-    RECT rect;
-    GetWindowRect(window, &rect);
+    // D3D9 uses client-area dimensions when the windowed backbuffer size
+    // is unspecified. GetWindowRect() contains the frame and its right/bottom
+    // values are screen coordinates, not dimensions.
+    if (!presentParameters->BackBufferWidth || !presentParameters->BackBufferHeight) {
+      HWND backBufferWindow = presentParameters->hDeviceWindow
+        ? presentParameters->hDeviceWindow : window;
+      RECT clientRect = {};
+      if (!backBufferWindow || !GetClientRect(backBufferWindow, &clientRect))
+        return log::d3derr(D3DERR_INVALIDCALL,
+          "Device creation: missing valid window for automatic backbuffer size.");
 
-    if (!presentParameters->BackBufferWidth)
-      presentParameters->BackBufferWidth = rect.right;
+      const LONG width = clientRect.right - clientRect.left;
+      const LONG height = clientRect.bottom - clientRect.top;
+      if (width <= 0 || height <= 0)
+        return log::d3derr(D3DERR_INVALIDCALL,
+          "Device creation: window client area has no drawable size.");
 
-    if (!presentParameters->BackBufferHeight)
-      presentParameters->BackBufferHeight = rect.bottom;
+      if (!presentParameters->BackBufferWidth)
+        presentParameters->BackBufferWidth = static_cast<UINT>(width);
+      if (!presentParameters->BackBufferHeight)
+        presentParameters->BackBufferHeight = static_cast<UINT>(height);
+    }
 
     if (!presentParameters->BackBufferCount)
       presentParameters->BackBufferCount = 1;
@@ -186,20 +205,24 @@ namespace dxup {
 
     *outDevice = d3d9Device;
 
+
     return D3D_OK;
   }
 
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) {
     CriticalSection cs(this);
 
+
     if (pPresentationParameters == nullptr)
       return log::d3derr(D3DERR_INVALIDCALL, "Reset: pPresentationParameters was nullptr.");
+
+    m_state->ResetFixedFunctionState();
 
     // Unbind current state...
     SetDepthStencilSurface(nullptr);
 
     for (uint32_t i = 0; i < 4; i++)
-      SetRenderTarget(0, nullptr);
+      SetRenderTarget(i, nullptr);
 
     // Setup new state...
 
@@ -452,9 +475,16 @@ namespace dxup {
   UINT    STDMETHODCALLTYPE Direct3DDevice9Ex::GetAvailableTextureMem() {
     CriticalSection cs(this);
 
-    DXGI_ADAPTER_DESC adapterDesc; 
-    m_adapter->GetDesc(&adapterDesc);
-    return UINT(adapterDesc.DedicatedVideoMemory / 1024ul);
+    DXGI_ADAPTER_DESC adapterDesc = {};
+    if (FAILED(m_adapter->GetDesc(&adapterDesc)))
+      return 0;
+
+    // IDirect3DDevice9::GetAvailableTextureMem returns bytes, NOT KiB.
+    // For integrated GPUs DXGI may report no dedicated video memory.
+    const SIZE_T availableBytes = adapterDesc.DedicatedVideoMemory
+      ? adapterDesc.DedicatedVideoMemory : adapterDesc.SharedSystemMemory;
+    return static_cast<UINT>(std::min<SIZE_T>(availableBytes,
+      std::numeric_limits<UINT>::max()));
   }
 
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::EvictManagedResources() {
@@ -477,7 +507,7 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetDeviceCaps(D3DCAPS9* pCaps) {
     CriticalSection cs(this);
 
-    return m_parent->GetDeviceCaps(0, D3DDEVTYPE_HAL, pCaps);
+    return m_parent->GetDeviceCaps(m_adapterNum, m_deviceType, pCaps);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetDisplayMode(UINT iSwapChain, D3DDISPLAYMODE* pMode) {
     CriticalSection cs(this);
@@ -593,6 +623,7 @@ namespace dxup {
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::Present(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion) {
     CriticalSection cs(this);
+
 
     m_renderer->endFrame();
     return PresentEx(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, 0);
@@ -918,34 +949,31 @@ namespace dxup {
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::BeginScene() {
     CriticalSection cs(this);
+
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::EndScene() {
     CriticalSection cs(this);
+
     m_context->Flush();
     return D3D_OK;
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::Clear(DWORD Count, CONST D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) {
     CriticalSection cs(this);
+
     return m_renderer->Clear(Count, pRects, Flags, Color, Z, Stencil);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetTransform(D3DTRANSFORMSTATETYPE State, CONST D3DMATRIX* pMatrix) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::SetTransform");
-    return D3D_OK;
+    return GetEditState()->SetTransform(State, pMatrix);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetTransform(D3DTRANSFORMSTATETYPE State, D3DMATRIX* pMatrix) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::GetTransform");
-    return D3D_OK;
+    return m_state->GetTransform(State, pMatrix);
   }
-  HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::MultiplyTransform(D3DTRANSFORMSTATETYPE TransformState, CONST D3DMATRIX* pMatrix) {
+  HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::MultiplyTransform(D3DTRANSFORMSTATETYPE State, CONST D3DMATRIX* pMatrix) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::MultiplyTransform");
-    return D3D_OK;
+    return GetEditState()->MultiplyTransform(State, pMatrix);
   }
   // TODO! Put viewport in state.
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetViewport(CONST D3DVIEWPORT9* pViewport) {
@@ -958,51 +986,35 @@ namespace dxup {
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetMaterial(CONST D3DMATERIAL9* pMaterial) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::SetMaterial");
-    return D3D_OK;
+    return GetEditState()->SetMaterial(pMaterial);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetMaterial(D3DMATERIAL9* pMaterial) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::GetMaterial");
-    return D3D_OK;
+    return m_state->GetMaterial(pMaterial);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetLight(DWORD Index, CONST D3DLIGHT9* pLight) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::SetLight");
-    return D3D_OK;
+    return GetEditState()->SetLight(Index, pLight);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetLight(DWORD Index, D3DLIGHT9* pLight) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::GetLight");
-    return D3D_OK;
+    return m_state->GetLight(Index, pLight);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::LightEnable(DWORD Index, BOOL Enable) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::LightEnable");
-    return D3D_OK;
+    return GetEditState()->LightEnable(Index, Enable);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetLightEnable(DWORD Index, BOOL* pEnable) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::GetLightEnable");
-    return D3D_OK;
+    return m_state->GetLightEnable(Index, pEnable);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetClipPlane(DWORD Index, CONST float* pPlane) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::SetClipPlane");
-    return D3D_OK;
+    return GetEditState()->SetClipPlane(Index, pPlane);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetClipPlane(DWORD Index, float* pPlane) {
     CriticalSection cs(this);
-
-    log::stub("Direct3DDevice9Ex::GetClipPlane");
-    return D3D_OK;
+    return m_state->GetClipPlane(Index, pPlane);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetRenderState(D3DRENDERSTATETYPE State, DWORD Value) {
     CriticalSection cs(this);
@@ -1016,11 +1028,16 @@ namespace dxup {
     CriticalSection cs(this);
     InitReturnPtr(ppSB);
     if (ppSB == nullptr)
-      return log::d3derr(D3DERR_INVALIDCALL, "CreateStateBlock: ppSB was nullptr");;
+      return log::d3derr(D3DERR_INVALIDCALL, "CreateStateBlock: ppSB was nullptr");
+    if (Type != D3DSBT_ALL && Type != D3DSBT_PIXELSTATE && Type != D3DSBT_VERTEXSTATE)
+      return log::d3derr(D3DERR_INVALIDCALL, "CreateStateBlock: invalid state block type");
 
     *ppSB = ref(new Direct3DStateBlock9(this, Type));
     
     return D3D_OK;
+  }
+  void Direct3DDevice9Ex::MarkTextureLODDirty(IDirect3DBaseTexture9* texture) {
+    m_state->MarkTextureLODDirty(texture);
   }
   D3D9State* Direct3DDevice9Ex::GetEditState() {
     if (m_stateBlock != nullptr)
@@ -1192,16 +1209,16 @@ namespace dxup {
     size_t count;
     {
       const D3DVERTEXELEMENT9* counter = pVertexElements;
-      while (counter->Stream != 0xff)
+      while (count = counter - pVertexElements, count < 64 && counter->Stream != 0xff)
         counter++;
-
-      count = counter - pVertexElements;
+      if (count == 64 || count == 0)
+        return D3DERR_INVALIDCALL;
     }
 
     d3d9Elements.resize(count);
     inputElements.reserve(count);
 
-    std::memcpy(&d3d9Elements[0], pVertexElements, sizeof(D3DVERTEXELEMENT9) * count);
+    std::memcpy(d3d9Elements.data(), pVertexElements, sizeof(D3DVERTEXELEMENT9) * count);
 
     for (size_t i = 0; i < count; i++) {
       D3D11_INPUT_ELEMENT_DESC desc;
@@ -1233,17 +1250,34 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetFVF(DWORD FVF) {
     CriticalSection cs(this);
 
-    m_fvf = FVF;
-    return D3D_OK;
+    // FVF is a vertex declaration, not merely a DWORD attached to the device.
+    // Storing it on the declaration also makes state-block capture/apply work.
+    fvf::Layout layout;
+    if (!fvf::parse(FVF, layout))
+      return D3DERR_INVALIDCALL;
+
+    std::vector<D3DVERTEXELEMENT9> elements;
+    elements.reserve(layout.elements.size() + 1);
+    for (const auto& e : layout.elements)
+      elements.push_back({0, e.offset, e.type, D3DDECLMETHOD_DEFAULT, e.usage, e.index});
+    elements.push_back(D3DDECL_END());
+    IDirect3DVertexDeclaration9* declaration = nullptr;
+    HRESULT result = CreateVertexDeclaration(elements.data(), &declaration);
+    if (FAILED(result)) return result;
+    static_cast<Direct3DVertexDeclaration9*>(declaration)->SetFVF(FVF);
+    result = GetEditState()->SetVertexDeclaration(declaration);
+    declaration->Release();
+    return result;
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetFVF(DWORD* pFVF) {
     CriticalSection cs(this);
-
     if (pFVF == nullptr)
       return log::d3derr(D3DERR_INVALIDCALL, "GetFVF: pFVF was nullptr");
-
-    *pFVF = m_fvf;
-    return D3D_OK;
+    IDirect3DVertexDeclaration9* decl = nullptr;
+    HRESULT result = m_state->GetVertexDeclaration(&decl);
+    *pFVF = decl ? static_cast<Direct3DVertexDeclaration9*>(decl)->GetFVF() : 0;
+    if (decl) decl->Release();
+    return result;
   }
 
   static int32_t shaderNums[2] = { 0, 0 };
@@ -1379,14 +1413,12 @@ namespace dxup {
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetStreamSourceFreq(UINT StreamNumber, UINT Setting) {
     CriticalSection cs(this);
 
-    log::stub("Direct3DDevice9Ex::SetStreamSourceFreq");
-    return D3D_OK;
+    return GetEditState()->SetStreamSourceFreq(StreamNumber, Setting);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::GetStreamSourceFreq(UINT StreamNumber, UINT* pSetting) {
     CriticalSection cs(this);
 
-    log::stub("Direct3DDevice9Ex::GetStreamSourceFreq");
-    return D3D_OK;
+    return m_state->GetStreamSourceFreq(StreamNumber, pSetting);
   }
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::SetIndices(IDirect3DIndexBuffer9* pIndexData) {
     CriticalSection cs(this);
@@ -1568,6 +1600,7 @@ namespace dxup {
 
   HRESULT STDMETHODCALLTYPE Direct3DDevice9Ex::PresentEx(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion, DWORD dwFlags) {
     CriticalSection cs(this);
+
 
     // Not sure what swapchain to use here, going with this one ~ Josh
     HRESULT result = GetInternalSwapchain(0)->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags);
