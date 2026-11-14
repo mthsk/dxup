@@ -491,7 +491,9 @@ namespace dxup {
       return D3D_OK;
 
     depthStencil = newSurface;
-    dirtyFlags |= dirtyFlags::renderTargets;
+    // The constant D3D9 depth bias must be rescaled when depth precision
+    // changes, so the rasterizer depends on the bound depth-stencil surface.
+    dirtyFlags |= dirtyFlags::renderTargets | dirtyFlags::rasterizer;
 
     return D3D_OK;
   }

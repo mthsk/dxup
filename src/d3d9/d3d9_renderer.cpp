@@ -3,6 +3,7 @@
 #include "d3d9_texture.h"
 #include "d3d9_mipmap.h"
 #include "d3d9_matrix_math.h"
+#include "d3d9_depth_bias.h"
 #include "d3d9_fixed_function.h"
 #include "d3d9_trianglefan.h"
 #include "../util/d3dcompiler_helpers.h"
@@ -765,7 +766,26 @@ namespace dxup {
     D3D11_RASTERIZER_DESC1 desc;
     desc.AntialiasedLineEnable = m_state->renderState[D3DRS_ANTIALIASEDLINEENABLE] == TRUE;
     desc.CullMode = convert::cullMode(m_state->renderState[D3DRS_CULLMODE]);
-    desc.DepthBias = (INT)reinterpret::dwordToFloat(m_state->renderState[D3DRS_DEPTHBIAS]);
+    // D3D9 expresses constant depth bias directly in normalized Z units,
+    // while D3D11 expresses it in integer depth-buffer steps. A cast to INT
+    // drops virtually every useful polygon offset to zero, hiding coplanar
+    // surfaces (including projected shadows) behind the depth buffer.
+    unsigned depthBits = 24;
+    if (m_state->depthStencil != nullptr) {
+      switch (m_state->depthStencil->GetD3D9Desc().Format) {
+      case D3DFMT_D16:
+      case D3DFMT_D16_LOCKABLE:
+        depthBits = 16;
+        break;
+      default:
+        // D24 and D24S8 use a 24-bit UNORM depth plane. Floating-point
+        // depth formats have a Z-dependent ULP; use the 24-bit near-midrange
+        // approximation until a format-specific shader bias is available.
+        break;
+      }
+    }
+    desc.DepthBias = depthBiasToD3D11(
+      reinterpret::dwordToFloat(m_state->renderState[D3DRS_DEPTHBIAS]), depthBits);
     desc.DepthBiasClamp = D3D11_DEFAULT_DEPTH_BIAS_CLAMP;
     desc.DepthClipEnable = true;
     desc.FillMode = convert::fillMode(m_state->renderState[D3DRS_FILLMODE]);
