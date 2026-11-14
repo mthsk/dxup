@@ -29,7 +29,7 @@ namespace dxup {
       fileValid = logFile != nullptr;
 
       if (fileValid)
-        fprintf(logFile, u8"DXUP - 🐸 - Version %s\n", DXUP_VERSION);
+        fprintf(logFile, "DXUP - 🐸 - Version %s\n", DXUP_VERSION);
     }
 
     void internal_write(const char* prefix, const char* fmt, va_list list) {
